@@ -16,21 +16,37 @@ def main() -> None:
     observation = world.get_observation()
     print(observation)
     step_count = 0
+    trajectory = []
 
     while True:
         throttle, steering = world.heuristic_action()
         world.move_car(throttle=throttle, steering=steering)
-        observation = world.step()
+        next_observation = world.step()
         step_count += 1
-        if world.goal_reached():
+        reached_goal = world.goal_reached()
+        hit_obstacle = world.hit_obstacle()
+        timed_out = step_count >= 1000
+        done = reached_goal or hit_obstacle or timed_out
+        trajectory.append(
+            {
+                "observation": observation,
+                "action": {"throttle": throttle, "steering": steering},
+                "next_observation": next_observation,
+                "done": done,
+            }
+        )
+        observation = next_observation
+        if reached_goal:
             print(f"goal reached at step {step_count}")
             break
-        if world.hit_obstacle():
+        if hit_obstacle:
             print(f"hit obstacle at step {step_count}")
             break
-        if step_count >= 1000:
+        if timed_out:
             print(f"timeout at step {step_count}")
             break
+
+    print(f"collected {len(trajectory)} samples")
 
 
 if __name__ == "__main__":

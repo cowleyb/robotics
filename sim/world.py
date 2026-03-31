@@ -176,7 +176,9 @@ class World:
             "obstacle_size": np.asarray(self.obstacle_size, dtype=np.float32),
         }
         if self.camera is not None:
-            observation["image"] = self.camera.render(rgb=True, depth=False, segmentation=False, normal=False)[0]
+            observation["image"] = self.camera.render(
+                rgb=True, depth=False, segmentation=False, normal=False
+            )[0]
         return observation
 
     def move_car(self, throttle: float, steering: float) -> None:
@@ -205,13 +207,36 @@ class World:
 
     def heuristic_action(self) -> tuple[float, float]:
         """should act as a teacher method in the simulations to return the correct values to get to the goal"""
+        """teacher is priveledged, can see all objects and goal"""
+
         car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
         car_quaternion = np.asarray(self.car.get_quat(), dtype=np.float32)
         goal_delta = np.asarray(self.goal_pos, dtype=np.float32)[:2] - car_position[:2]
+        obstacle_positions = np.asarray(self.obstacle_positions, dtype=np.float32)[
+            :, :2
+        ]
 
         w, x, y, z = car_quaternion
         yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-        target_yaw = np.arctan2(goal_delta[1], goal_delta[0])
+        forward = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
+        right = np.array([-forward[1], forward[0]], dtype=np.float32)
+
+        target_vector = goal_delta.astype(np.float32)
+        goal_distance = np.linalg.norm(target_vector)
+        if goal_distance > 1e-6:
+            target_vector /= goal_distance
+
+        for obstacle_position in obstacle_positions:
+            obstacle_delta = obstacle_position - car_position[:2]
+            forward_distance = float(np.dot(obstacle_delta, forward))
+            lateral_distance = float(np.dot(obstacle_delta, right))
+            if 0.0 < forward_distance < 1.2 and abs(lateral_distance) < 0.6:
+                avoidance_strength = (1.2 - forward_distance) / 1.2
+                target_vector += (
+                    -np.sign(lateral_distance) * 1.5 * avoidance_strength
+                ) * right
+
+        target_yaw = np.arctan2(target_vector[1], target_vector[0])
         yaw_error = np.arctan2(np.sin(target_yaw - yaw), np.cos(target_yaw - yaw))
 
         steering = float(np.clip(1.5 * yaw_error, -0.4, 0.4))
