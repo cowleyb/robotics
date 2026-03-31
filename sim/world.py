@@ -177,6 +177,18 @@ class World:
             dofs_idx_local=self.drive_dofs,
         )
 
+    def goal_reached(self) -> bool:
+        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
+        goal_position = np.asarray(self.goal_pos, dtype=np.float32)
+        return np.linalg.norm(car_position[:2] - goal_position[:2]) < 0.4
+
+    def hit_obstacle(self) -> bool:
+        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
+        obstacle_positions = np.asarray(self.obstacle_positions, dtype=np.float32)
+        obstacle_delta = obstacle_positions[:, :2] - car_position[:2]
+        obstacle_distance = np.linalg.norm(obstacle_delta, axis=1)
+        return bool(np.any(obstacle_distance < 0.35))
+
     def step(self) -> dict[str, np.ndarray]:
         self.scene.step()
         return self.get_observation()
