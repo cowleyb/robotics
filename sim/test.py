@@ -12,7 +12,7 @@ def main() -> None:
     world = World(seed=1)
 
     while True:
-        world.scene.step()
+        world.step()
 
 
 if __name__ == "__main__":

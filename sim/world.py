@@ -6,10 +6,18 @@ import random
 class World:
     """simple test world for genesis"""
 
+    _gs_initialized = False
+
     def __init__(
         self,
-        seed: int = 42,
+        seed: int = 1,
+        show_viewer: bool = True,
+        obstacle_count: int = 10,
+        backend=gs.gpu,
     ) -> None:
+        self.show_viewer = show_viewer
+        self.obstacle_count = obstacle_count
+        self.backend = backend
         self._build_world(seed)
 
     @staticmethod
@@ -30,10 +38,12 @@ class World:
     def _build_world(self, seed: int) -> None:
         self.seed = seed
         self.rng = random.Random(seed)
-        gs.init(backend=gs.gpu)
+        if not World._gs_initialized:
+            gs.init(backend=self.backend)
+            World._gs_initialized = True
 
         self.scene = gs.Scene(
-            show_viewer=True,
+            show_viewer=self.show_viewer,
             sim_options=gs.options.SimOptions(dt=0.01, gravity=(0, 0, -9.81)),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(5.0, -5.0, 4.0),
@@ -95,7 +105,7 @@ class World:
         self.obstacles = []
         self.obstacle_size = (0.4, 0.4, 0.5)
         self.obstacle_positions = []
-        for i in range(10):
+        for i in range(self.obstacle_count):
             while True:
                 obs_pos = (
                     self.rng.uniform(-3.0, 3.0),
@@ -123,3 +133,11 @@ class World:
             self.obstacles.append(obstacle)
 
         self.scene.build()
+
+    def step(self) -> None:
+        self.scene.step()
+
+    def reset(self, seed: int | None = None) -> "World":
+        next_seed = self.seed if seed is None else seed
+        self._build_world(next_seed)
+        return self
