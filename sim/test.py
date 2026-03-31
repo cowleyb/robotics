@@ -10,9 +10,12 @@ from sim.world import World
 
 def main() -> None:
     world = World(seed=1)
+    observation = world.get_observation()
+    print(observation)
 
     while True:
-        world.step()
+        world.move_car(throttle=10.0, steering=0.0)
+        observation = world.step()
 
 
 if __name__ == "__main__":

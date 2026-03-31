@@ -1,6 +1,9 @@
+from pathlib import Path
 import genesis as gs
 import numpy as np
 import random
+
+CAR_URDF_PATH = Path(__file__).resolve().parents[1] / "assets" / "simplecar.urdf"
 
 
 class World:
@@ -62,18 +65,27 @@ class World:
         self.car_pos = (
             self.rng.uniform(-3.0, 0.0),
             self.rng.uniform(-3.0, 0.0),
-            2.0,
+            0.12,
         )
 
         self.car = self.scene.add_entity(
-            gs.morphs.Box(
+            gs.morphs.URDF(
+                file=str(CAR_URDF_PATH),
                 pos=self.car_pos,
-                size=self.car_size,
                 collision=True,
             ),
-            surface=gs.surfaces.Plastic(color=(1.0, 0.0, 1.0)),
             name="car",
         )
+        self.steering_dofs = [
+            self.car.get_joint("base_to_left_hinge").dofs_idx_local[0],
+            self.car.get_joint("base_to_right_hinge").dofs_idx_local[0],
+        ]
+        self.drive_dofs = [
+            self.car.get_joint("left_hinge_to_left_front_wheel").dofs_idx_local[0],
+            self.car.get_joint("right_hinge_to_right_front_wheel").dofs_idx_local[0],
+            self.car.get_joint("base_to_left_back_wheel").dofs_idx_local[0],
+            self.car.get_joint("base_to_right_back_wheel").dofs_idx_local[0],
+        ]
         self.spawned_objects.append((self.car_pos, self.car_size))
 
         self.goal_size = (0.5, 0.5, 0.1)
@@ -134,10 +146,42 @@ class World:
 
         self.scene.build()
 
-    def step(self) -> None:
-        self.scene.step()
+    def get_observation(self) -> dict[str, np.ndarray]:
+        return {
+            "car_position": np.asarray(self.car.get_pos(), dtype=np.float32),
+            "car_quaternion": np.asarray(self.car.get_quat(), dtype=np.float32),
+            "car_linear_velocity": np.asarray(self.car.get_vel(), dtype=np.float32),
+            "car_angular_velocity": np.asarray(self.car.get_ang(), dtype=np.float32),
+            "car_size": np.asarray(self.car_size, dtype=np.float32),
+            "steering_position": np.asarray(
+                self.car.get_dofs_position(self.steering_dofs), dtype=np.float32
+            ),
+            "wheel_velocity": np.asarray(
+                self.car.get_dofs_velocity(self.drive_dofs), dtype=np.float32
+            ),
+            "goal_position": np.asarray(self.goal_pos, dtype=np.float32),
+            "goal_size": np.asarray(self.goal_size, dtype=np.float32),
+            "obstacle_positions": np.asarray(self.obstacle_positions, dtype=np.float32),
+            "obstacle_size": np.asarray(self.obstacle_size, dtype=np.float32),
+        }
 
-    def reset(self, seed: int | None = None) -> "World":
+    def move_car(self, throttle: float, steering: float) -> None:
+        self.car.control_dofs_position(
+            position=np.array([steering, steering], dtype=np.float32),
+            dofs_idx_local=self.steering_dofs,
+        )
+        self.car.control_dofs_velocity(
+            velocity=np.array(
+                [throttle, throttle, throttle, throttle], dtype=np.float32
+            ),
+            dofs_idx_local=self.drive_dofs,
+        )
+
+    def step(self) -> dict[str, np.ndarray]:
+        self.scene.step()
+        return self.get_observation()
+
+    def reset(self, seed: int | None = None) -> dict[str, np.ndarray]:
         next_seed = self.seed if seed is None else seed
         self._build_world(next_seed)
-        return self
+        return self.get_observation()
