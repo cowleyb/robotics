@@ -15,10 +15,12 @@ class World:
         self,
         seed: int = 1,
         show_viewer: bool = True,
+        enable_camera: bool = False,
         obstacle_count: int = 10,
         backend=gs.gpu,
     ) -> None:
         self.show_viewer = show_viewer
+        self.enable_camera = enable_camera
         self.obstacle_count = obstacle_count
         self.backend = backend
         self._build_world(seed)
@@ -86,6 +88,15 @@ class World:
             self.car.get_joint("base_to_left_back_wheel").dofs_idx_local[0],
             self.car.get_joint("base_to_right_back_wheel").dofs_idx_local[0],
         ]
+        self.camera = None
+        if self.enable_camera:
+            self.camera = self.scene.add_camera(
+                res=(128, 128),
+                pos=(self.car_pos[0] - 0.6, self.car_pos[1], 0.45),
+                lookat=(self.car_pos[0] + 1.0, self.car_pos[1], 0.15),
+                fov=90,
+                GUI=False,
+            )
         self.spawned_objects.append((self.car_pos, self.car_size))
 
         self.goal_size = (0.5, 0.5, 0.1)
@@ -147,7 +158,7 @@ class World:
         self.scene.build()
 
     def get_observation(self) -> dict[str, np.ndarray]:
-        return {
+        observation = {
             "car_position": np.asarray(self.car.get_pos(), dtype=np.float32),
             "car_quaternion": np.asarray(self.car.get_quat(), dtype=np.float32),
             "car_linear_velocity": np.asarray(self.car.get_vel(), dtype=np.float32),
@@ -164,6 +175,9 @@ class World:
             "obstacle_positions": np.asarray(self.obstacle_positions, dtype=np.float32),
             "obstacle_size": np.asarray(self.obstacle_size, dtype=np.float32),
         }
+        if self.camera is not None:
+            observation["image"] = self.camera.render(rgb=True, depth=False, segmentation=False, normal=False)[0]
+        return observation
 
     def move_car(self, throttle: float, steering: float) -> None:
         self.car.control_dofs_position(
@@ -187,7 +201,22 @@ class World:
         obstacle_positions = np.asarray(self.obstacle_positions, dtype=np.float32)
         obstacle_delta = obstacle_positions[:, :2] - car_position[:2]
         obstacle_distance = np.linalg.norm(obstacle_delta, axis=1)
-        return bool(np.any(obstacle_distance < 0.35))
+        return bool(np.any(obstacle_distance < 0.5))
+
+    def heuristic_action(self) -> tuple[float, float]:
+        """should act as a teacher method in the simulations to return the correct values to get to the goal"""
+        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
+        car_quaternion = np.asarray(self.car.get_quat(), dtype=np.float32)
+        goal_delta = np.asarray(self.goal_pos, dtype=np.float32)[:2] - car_position[:2]
+
+        w, x, y, z = car_quaternion
+        yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        target_yaw = np.arctan2(goal_delta[1], goal_delta[0])
+        yaw_error = np.arctan2(np.sin(target_yaw - yaw), np.cos(target_yaw - yaw))
+
+        steering = float(np.clip(1.5 * yaw_error, -0.4, 0.4))
+        throttle = 10.0
+        return throttle, steering
 
     def step(self) -> dict[str, np.ndarray]:
         self.scene.step()

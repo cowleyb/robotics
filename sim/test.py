@@ -1,5 +1,8 @@
+import os
 from pathlib import Path
 import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -9,23 +12,24 @@ from sim.world import World
 
 
 def main() -> None:
-    world = World(seed=1)
+    world = World(seed=1, enable_camera=True)
     observation = world.get_observation()
     print(observation)
     step_count = 0
 
     while True:
-        world.move_car(throttle=10.0, steering=0.0)
+        throttle, steering = world.heuristic_action()
+        world.move_car(throttle=throttle, steering=steering)
         observation = world.step()
         step_count += 1
         if world.goal_reached():
-            print("goal reached")
+            print(f"goal reached at step {step_count}")
             break
         if world.hit_obstacle():
-            print("hit obstacle")
+            print(f"hit obstacle at step {step_count}")
             break
         if step_count >= 1000:
-            print("timeout")
+            print(f"timeout at step {step_count}")
             break
 
 
