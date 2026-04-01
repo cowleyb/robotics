@@ -4,10 +4,23 @@ import numpy as np
 import random
 
 from sim.car_geometry import load_simplecar_geometry
+from sim.control_limits import DEFAULT_DRIVE_LIMITS
+from sim.path_planning import (
+    EnvironmentBounds,
+    ObstacleBox,
+    PlannerConfig,
+    PurePursuitConfig,
+    TeacherPlanner,
+    VehicleGeometry,
+    VehicleState,
+)
 
 CAR_URDF_PATH = Path(__file__).resolve().parents[1] / "assets" / "simplecar.urdf"
-DEFAULT_FORWARD_THROTTLE = 15.0
-DEFAULT_REVERSE_THROTTLE = -5.0
+DRIVE_LIMITS = DEFAULT_DRIVE_LIMITS
+
+# backward compatible aliases for older callers
+DEFAULT_FORWARD_THROTTLE = DRIVE_LIMITS.max_forward_wheel_speed
+DEFAULT_REVERSE_THROTTLE = -DRIVE_LIMITS.max_reverse_wheel_speed
 
 
 _CAR_GEOM = load_simplecar_geometry(CAR_URDF_PATH)
@@ -63,9 +76,9 @@ class World:
             show_viewer=self.show_viewer,
             sim_options=gs.options.SimOptions(dt=0.01, gravity=(0, 0, -9.81)),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(5.0, -5.0, 4.0),
-                camera_lookat=(0.0, 0.0, 0.2),
-                camera_fov=45,
+                camera_pos=(0.0, 0.0, 10.0),
+                camera_lookat=(0.0, 0.0, 0.0),
+                camera_fov=60,
             ),
             # vis_options=gs.options.VisOptions(
         )
@@ -76,6 +89,14 @@ class World:
 
         self.spawned_objects = []
         self.car_size = _CAR_GEOM.base_size
+        self.spawn_car_size = (
+            max(float(self.car_size[0]), float(WHEELBASE + 2.0 * _CAR_GEOM.wheel_radius)),
+            max(
+                float(self.car_size[1]),
+                float(max(FRONT_TRACK, REAR_TRACK) + _CAR_GEOM.wheel_width),
+            ),
+            float(self.car_size[2]),
+        )
         self.car_pos = (
             self.rng.uniform(-3.0, 0.0),
             self.rng.uniform(-3.0, 0.0),
@@ -119,7 +140,7 @@ class World:
                 fov=90,
                 GUI=False,
             )
-        self.spawned_objects.append((self.car_pos, self.car_size))
+        self.spawned_objects.append((self.car_pos, self.spawn_car_size))
 
         self.goal_size = (0.5, 0.5, 0.1)
         while True:
@@ -176,6 +197,38 @@ class World:
             self.spawned_objects.append((obs_pos, self.obstacle_size))
             self.obstacle_positions.append(obs_pos)
             self.obstacles.append(obstacle)
+
+        self.teacher_obstacles = [
+            ObstacleBox(
+                center_x=float(position[0]),
+                center_y=float(position[1]),
+                size_x=float(self.obstacle_size[0]),
+                size_y=float(self.obstacle_size[1]),
+            )
+            for position in self.obstacle_positions
+        ]
+        self.teacher_planner = TeacherPlanner(
+            geometry=VehicleGeometry(
+                wheelbase=WHEELBASE,
+                max_steering_angle=MAX_STEERING_ANGLE,
+                length=float(self.spawn_car_size[0]),
+                width=float(self.spawn_car_size[1]),
+                wheel_radius=float(_CAR_GEOM.wheel_radius),
+            ),
+            bounds=EnvironmentBounds(
+                min_x=-3.25,
+                max_x=3.25,
+                min_y=-3.25,
+                max_y=3.25,
+            ),
+            planner_config=PlannerConfig(obstacle_margin=0.10),
+            controller_config=PurePursuitConfig(
+                nominal_speed=1.8,
+                slow_speed=0.6,
+                max_forward_wheel_speed=DRIVE_LIMITS.max_forward_wheel_speed,
+                max_reverse_wheel_speed=DRIVE_LIMITS.max_reverse_wheel_speed,
+            ),
+        )
 
         self.scene.build()
 
@@ -276,70 +329,40 @@ class World:
         return np.linalg.norm(car_position[:2] - goal_position[:2]) < 0.3
 
     def hit_obstacle(self) -> bool:
-        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
-        car_quat = np.asarray(self.car.get_quat(), dtype=np.float32)
-        car_yaw = self._yaw_from_quat(car_quat)
-
-        car_half = 0.5 * np.asarray(self.car_size[:2], dtype=np.float32)
-        obs_half = 0.5 * np.asarray(self.obstacle_size[:2], dtype=np.float32)
-        safety_margin = 0.05
-        car_half = car_half + safety_margin
-        obs_half = obs_half + safety_margin
-
-        c = car_position[:2].astype(np.float32)
-        o = np.asarray(self.obstacle_positions, dtype=np.float32)[:, :2]
-
-        cy, sy = float(np.cos(car_yaw)), float(np.sin(car_yaw))
-        car_axes = (
-            np.array([cy, sy], dtype=np.float32),
-            np.array([-sy, cy], dtype=np.float32),
-        )
-        world_axes = (
-            np.array([1.0, 0.0], dtype=np.float32),
-            np.array([0.0, 1.0], dtype=np.float32),
-        )
-
-        def _overlap_on_axis(
-            center_delta: np.ndarray,
-            axis: np.ndarray,
-            a_axes: tuple[np.ndarray, np.ndarray],
-            a_half: np.ndarray,
-            b_axes: tuple[np.ndarray, np.ndarray],
-            b_half: np.ndarray,
-        ) -> bool:
-            axis = axis / max(float(np.linalg.norm(axis)), 1e-8)
-            proj_center = float(abs(np.dot(center_delta, axis)))
-            proj_a = float(
-                abs(np.dot(a_axes[0] * a_half[0], axis))
-                + abs(np.dot(a_axes[1] * a_half[1], axis))
+        for obstacle in self.obstacles:
+            contact_info = self.car.get_contacts(with_entity=obstacle)
+            geom_a = contact_info["geom_a"]
+            contact_count = (
+                int(geom_a.numel()) if hasattr(geom_a, "numel") else int(geom_a.size)
             )
-            proj_b = float(
-                abs(np.dot(b_axes[0] * b_half[0], axis))
-                + abs(np.dot(b_axes[1] * b_half[1], axis))
-            )
-            return proj_center <= (proj_a + proj_b)
-
-        for obs_center in o:
-            d = (obs_center - c).astype(np.float32)
-            axes_to_test = (car_axes[0], car_axes[1], world_axes[0], world_axes[1])
-            if all(
-                _overlap_on_axis(
-                    d,
-                    axis,
-                    car_axes,
-                    car_half,
-                    world_axes,
-                    obs_half,
-                )
-                for axis in axes_to_test
-            ):
+            if contact_count > 0:
                 return True
         return False
 
     def heuristic_action(self) -> tuple[float, float]:
         """should act as a teacher method in the simulations to return the correct values to get to the goal"""
         """teacher is priveledged, can see all objects and goal"""
-        return (0, 0)
+        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
+        car_quat = np.asarray(self.car.get_quat(), dtype=np.float32)
+        car_velocity = np.asarray(self.car.get_vel(), dtype=np.float32)
+        car_yaw = self._yaw_from_quat(car_quat)
+
+        heading = np.array([np.cos(car_yaw), np.sin(car_yaw)], dtype=np.float32)
+        signed_speed = float(np.linalg.norm(car_velocity[:2]))
+        if float(np.dot(car_velocity[:2], heading)) < 0.0:
+            signed_speed *= -1.0
+
+        throttle, steering = self.teacher_planner.compute_action(
+            state=VehicleState(
+                x=float(car_position[0]),
+                y=float(car_position[1]),
+                yaw=car_yaw,
+                speed=signed_speed,
+            ),
+            goal_xy=np.asarray(self.goal_pos[:2], dtype=np.float32),
+            obstacles=self.teacher_obstacles,
+        )
+        return (float(throttle), float(steering))
 
     def step(self) -> dict[str, np.ndarray]:
         self.scene.step()

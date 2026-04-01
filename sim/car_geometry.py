@@ -25,6 +25,7 @@ class CarGeometry:
     rear_track: float
     base_size: tuple[float, float, float]
     wheel_radius: float
+    wheel_width: float
 
 
 def _parse_xyz(value: str) -> np.ndarray:
@@ -73,7 +74,7 @@ def _link_box_size(root: ET.Element, link_name: str) -> np.ndarray:
     return _parse_xyz(box.attrib["size"])
 
 
-def _wheel_radius(root: ET.Element, wheel_link_name: str) -> float:
+def _wheel_dimensions(root: ET.Element, wheel_link_name: str) -> tuple[float, float]:
     link = root.find(f"./link[@name='{wheel_link_name}']")
     if link is None:
         raise ValueError(f"URDF link not found: {wheel_link_name}")
@@ -82,7 +83,9 @@ def _wheel_radius(root: ET.Element, wheel_link_name: str) -> float:
     )
     if cyl is None or "radius" not in cyl.attrib:
         raise ValueError(f"URDF wheel missing cylinder radius: {wheel_link_name}")
-    return float(cyl.attrib["radius"])
+    if "length" not in cyl.attrib:
+        raise ValueError(f"URDF wheel missing cylinder length: {wheel_link_name}")
+    return float(cyl.attrib["radius"]), float(cyl.attrib["length"])
 
 
 def load_simplecar_geometry(urdf_path: Path) -> CarGeometry:
@@ -103,7 +106,7 @@ def load_simplecar_geometry(urdf_path: Path) -> CarGeometry:
     rear_track = float(abs(left_rear[1] - right_rear[1]))
 
     base_box = _link_box_size(root, "base_link")
-    wheel_r = _wheel_radius(root, "left_front_wheel")
+    wheel_r, wheel_w = _wheel_dimensions(root, "left_front_wheel")
 
     return CarGeometry(
         max_steering_angle=float(max_steer),
@@ -115,4 +118,5 @@ def load_simplecar_geometry(urdf_path: Path) -> CarGeometry:
         rear_track=float(rear_track),
         base_size=(float(base_box[0]), float(base_box[1]), float(base_box[2])),
         wheel_radius=float(wheel_r),
+        wheel_width=float(wheel_w),
     )
