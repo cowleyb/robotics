@@ -276,10 +276,64 @@ class World:
 
     def hit_obstacle(self) -> bool:
         car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
-        obstacle_positions = np.asarray(self.obstacle_positions, dtype=np.float32)
-        obstacle_delta = obstacle_positions[:, :2] - car_position[:2]
-        obstacle_distance = np.linalg.norm(obstacle_delta, axis=1)
-        return bool(np.any(obstacle_distance < 0.3))
+        car_quat = np.asarray(self.car.get_quat(), dtype=np.float32)
+        car_yaw = self._yaw_from_quat(car_quat)
+
+        car_half = 0.5 * np.asarray(self.car_size[:2], dtype=np.float32)
+        obs_half = 0.5 * np.asarray(self.obstacle_size[:2], dtype=np.float32)
+        safety_margin = 0.05
+        car_half = car_half + safety_margin
+        obs_half = obs_half + safety_margin
+
+        c = car_position[:2].astype(np.float32)
+        o = np.asarray(self.obstacle_positions, dtype=np.float32)[:, :2]
+
+        cy, sy = float(np.cos(car_yaw)), float(np.sin(car_yaw))
+        car_axes = (
+            np.array([cy, sy], dtype=np.float32),
+            np.array([-sy, cy], dtype=np.float32),
+        )
+        world_axes = (
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        )
+
+        def _overlap_on_axis(
+            center_delta: np.ndarray,
+            axis: np.ndarray,
+            a_axes: tuple[np.ndarray, np.ndarray],
+            a_half: np.ndarray,
+            b_axes: tuple[np.ndarray, np.ndarray],
+            b_half: np.ndarray,
+        ) -> bool:
+            axis = axis / max(float(np.linalg.norm(axis)), 1e-8)
+            proj_center = float(abs(np.dot(center_delta, axis)))
+            proj_a = float(
+                abs(np.dot(a_axes[0] * a_half[0], axis))
+                + abs(np.dot(a_axes[1] * a_half[1], axis))
+            )
+            proj_b = float(
+                abs(np.dot(b_axes[0] * b_half[0], axis))
+                + abs(np.dot(b_axes[1] * b_half[1], axis))
+            )
+            return proj_center <= (proj_a + proj_b)
+
+        for obs_center in o:
+            d = (obs_center - c).astype(np.float32)
+            axes_to_test = (car_axes[0], car_axes[1], world_axes[0], world_axes[1])
+            if all(
+                _overlap_on_axis(
+                    d,
+                    axis,
+                    car_axes,
+                    car_half,
+                    world_axes,
+                    obs_half,
+                )
+                for axis in axes_to_test
+            ):
+                return True
+        return False
 
     def heuristic_action(self) -> tuple[float, float]:
         """should act as a teacher method in the simulations to return the correct values to get to the goal"""
