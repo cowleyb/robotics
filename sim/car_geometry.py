@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
 
+def min_turning_radius(wheelbase: float, max_steering_angle: float) -> float:
+    """minimum turning radius  using bicycle model"""
+    denom = math.tan(float(max_steering_angle))
+    if abs(denom) < 1e-9:
+        return float("inf")
+    return float(wheelbase) / abs(denom)
+
+
 @dataclass(frozen=True)
 class CarGeometry:
     max_steering_angle: float
     wheelbase: float
+    min_turning_radius: float
     front_track: float
     rear_track: float
     base_size: tuple[float, float, float]
@@ -98,9 +108,11 @@ def load_simplecar_geometry(urdf_path: Path) -> CarGeometry:
     return CarGeometry(
         max_steering_angle=float(max_steer),
         wheelbase=float(wheelbase),
+        min_turning_radius=min_turning_radius(
+            wheelbase=wheelbase, max_steering_angle=max_steer
+        ),
         front_track=float(front_track),
         rear_track=float(rear_track),
         base_size=(float(base_box[0]), float(base_box[1]), float(base_box[2])),
         wheel_radius=float(wheel_r),
     )
-

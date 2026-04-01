@@ -13,6 +13,7 @@ DEFAULT_REVERSE_THROTTLE = -5.0
 _CAR_GEOM = load_simplecar_geometry(CAR_URDF_PATH)
 MAX_STEERING_ANGLE = _CAR_GEOM.max_steering_angle
 WHEELBASE = _CAR_GEOM.wheelbase
+MIN_TURNING_RADIUS = _CAR_GEOM.min_turning_radius
 FRONT_TRACK = _CAR_GEOM.front_track
 REAR_TRACK = _CAR_GEOM.rear_track
 
@@ -209,7 +210,7 @@ class World:
     def move_car(self, throttle: float, steering: float) -> None:
         steering = float(np.clip(steering, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE))
         self.commanded_throttle += 0.2 * (throttle - self.commanded_throttle)
-        self.commanded_steering += 0.3 * (steering - self.commanded_steering)
+        self.commanded_steering = steering
         steering_targets = np.array(
             [self.commanded_steering, self.commanded_steering], dtype=np.float32
         )
