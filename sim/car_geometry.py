@@ -23,6 +23,8 @@ class CarGeometry:
     min_turning_radius: float
     front_track: float
     rear_track: float
+    front_axle_x: float
+    rear_axle_x: float
     base_size: tuple[float, float, float]
     wheel_radius: float
     wheel_width: float
@@ -111,6 +113,8 @@ def load_simplecar_geometry(urdf_path: Path) -> CarGeometry:
         ),
         front_track=float(front_track),
         rear_track=float(rear_track),
+        front_axle_x=float(front_x),
+        rear_axle_x=float(rear_x),
         base_size=(float(base_box[0]), float(base_box[1]), float(base_box[2])),
         wheel_radius=float(wheel_r),
         wheel_width=float(wheel_w),

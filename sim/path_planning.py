@@ -7,6 +7,7 @@ from typing import Iterable
 
 import numpy as np
 from scipy.interpolate import UnivariateSpline
+from scipy.optimize import minimize
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -21,6 +22,8 @@ class VehicleGeometry:
     length: float
     width: float
     wheel_radius: float
+    collision_center_offset: float = 0.0
+    rear_axle_offset: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -80,22 +83,34 @@ class PlannerConfig:
     heuristic_weight: float = 1.8  # how strongly this aims toward the goal
     smoothing_factor: float = 0.02  # how much this rounds off the final route
     smoothing_resolution: float = 0.05  # spacing for the rounded off route
-    replan_distance: float = (
-        0.15  # if the car drifts this far from the route, plan again
-    )
+    replan_distance: float = 0.25
+    escape_max_primitives: int = 3  # if the spawn starts inside the safety margin, allow a short physical-footprint escape first
 
 
 @dataclass(frozen=True)
-class PurePursuitConfig:
-    lookahead_gain: float = 0.4  # faster speed looks further ahead
-    min_lookahead: float = 0.25  # do not look too close even at low speed
-    max_lookahead: float = 0.8  # do not look too far even at high speed
+class KinematicMPCConfig:
+    horizon_steps: int = 6
+    control_interval_steps: int = 5  # solve once and reuse it for a few sim ticks
+    sim_dt: float = 0.01
+    reference_spacing: float = (
+        0.08  # keep preview close enough to avoid cutting inside tight turns
+    )
     nominal_speed: float = 1.0  # normal cruising speed
     slow_speed: float = 0.35  # careful speed near tricky spots
     goal_slowdown_distance: float = 0.8  # start slowing as the car gets near the goal
-    cusp_slowdown_distance: float = 0.45  # slow near a forward to reverse switch
-    cusp_switch_distance: float = 0.12  # how close before the switch is accepted
-    speed_gain: float = 0.75  # how strongly this corrects speed errors
+    cusp_slowdown_distance: float = 0.6  # slow earlier near a forward to reverse switch
+    cusp_switch_distance: float = 0.16  # accept the switch a bit sooner when close
+    actuator_response: float = 0.2  # matches the throttle smoothing in sim.world
+    position_cost: float = 16.0
+    yaw_cost: float = 4.0
+    speed_cost: float = 0.8
+    wheel_speed_cost: float = 0.02
+    wheel_speed_rate_cost: float = 0.08
+    steering_cost: float = 0.05
+    steering_rate_cost: float = 0.9
+    terminal_position_cost: float = 28.0
+    terminal_yaw_cost: float = 6.0
+    optimizer_maxiter: int = 14
     max_forward_wheel_speed: float = 20.0
     max_reverse_wheel_speed: float = 8.0
 
@@ -167,14 +182,19 @@ def vehicle_collides(
     # returns true if the car would be outside the world or touching an obstacle
     if not (bounds.min_x <= x <= bounds.max_x and bounds.min_y <= y <= bounds.max_y):
         return True
-
-    vehicle_center = np.array([x, y], dtype=np.float32)
+    cy = float(math.cos(yaw))
+    sy = float(math.sin(yaw))
+    vehicle_center = np.array(
+        [
+            x + geometry.collision_center_offset * cy,
+            y + geometry.collision_center_offset * sy,
+        ],
+        dtype=np.float32,
+    )
     vehicle_half = np.array(
         [geometry.length * 0.5 + margin, geometry.width * 0.5 + margin],
         dtype=np.float32,
     )
-    cy = float(math.cos(yaw))
-    sy = float(math.sin(yaw))
     vehicle_axes = (
         np.array([cy, sy], dtype=np.float32),
         np.array([-sy, cy], dtype=np.float32),
@@ -262,6 +282,43 @@ class HybridAStarPlanner:
             cost=0.0,
             parent_key=None,
         )
+        escape_prefix: PlannedPath | None = None
+        if vehicle_collides(
+            start.x,
+            start.y,
+            start.yaw,
+            obstacles,
+            self.bounds,
+            self.geometry,
+            self.config.obstacle_margin,
+        ):
+            if vehicle_collides(
+                start.x,
+                start.y,
+                start.yaw,
+                obstacles,
+                self.bounds,
+                self.geometry,
+                0.0,
+            ):
+                return None
+            escape_result = self._plan_buffer_escape(start_node, obstacles)
+            if escape_result is None:
+                return None
+            escape_prefix, escape_end = escape_result
+            start_node = _SearchNode(
+                x_index=self._x_index(escape_end.x),
+                y_index=self._y_index(escape_end.y),
+                yaw_index=self._yaw_index(escape_end.yaw),
+                direction=escape_end.direction,
+                x_values=[float(escape_end.x)],
+                y_values=[float(escape_end.y)],
+                yaw_values=[wrap_to_pi(escape_end.yaw)],
+                directions=[int(escape_end.direction)],
+                steer=escape_end.steer,
+                cost=escape_end.cost,
+                parent_key=None,
+            )
 
         open_nodes: dict[tuple[int, int, int, int], _SearchNode] = {
             start_node.key(): start_node
@@ -290,12 +347,18 @@ class HybridAStarPlanner:
             closed_nodes[current_key] = current
 
             if self._goal_reached(current, goal_xy):
-                return self._build_path(closed_nodes, current, obstacles)
+                return self._prepend_path(
+                    escape_prefix,
+                    self._build_path(closed_nodes, current, obstacles),
+                )
 
             analytic_node = self._try_analytic_connection(current, goal_xy, obstacles)
             if analytic_node is not None:
                 closed_nodes[analytic_node.key()] = analytic_node
-                return self._build_path(closed_nodes, analytic_node, obstacles)
+                return self._prepend_path(
+                    escape_prefix,
+                    self._build_path(closed_nodes, analytic_node, obstacles),
+                )
 
             # from the current pose try short moves with different steering
             for steer in self._steer_values:
@@ -329,6 +392,7 @@ class HybridAStarPlanner:
         direction: int,
         obstacles: list[ObstacleBox],
         travel_distance: float | None = None,
+        collision_margin: float | None = None,
     ) -> _SearchNode | None:
         # simulates driving a short distance and records the points along the way
         x = current.x
@@ -343,6 +407,11 @@ class HybridAStarPlanner:
             self.config.primitive_length
             if travel_distance is None
             else max(float(travel_distance), self.config.motion_resolution)
+        )
+        margin = (
+            self.config.obstacle_margin
+            if collision_margin is None
+            else float(collision_margin)
         )
         signed_step = self.config.motion_resolution * direction
         steps = max(2, int(math.ceil(path_length / self.config.motion_resolution)))
@@ -360,7 +429,7 @@ class HybridAStarPlanner:
                 obstacles,
                 self.bounds,
                 self.geometry,
-                self.config.obstacle_margin,
+                margin,
             ):
                 return None
             x_values.append(x)
@@ -390,6 +459,50 @@ class HybridAStarPlanner:
             cost=current.cost + transition_cost,
             parent_key=current.key(),
         )
+
+    def _plan_buffer_escape(
+        self,
+        start_node: _SearchNode,
+        obstacles: list[ObstacleBox],
+    ) -> tuple[PlannedPath, _SearchNode] | None:
+        frontier: list[tuple[list[_SearchNode], _SearchNode]] = [([], start_node)]
+        for _ in range(self.config.escape_max_primitives):
+            escape_candidates: list[tuple[float, list[_SearchNode]]] = []
+            next_frontier: list[tuple[float, list[_SearchNode], _SearchNode]] = []
+            for chain, current in frontier:
+                for steer in self._steer_values:
+                    for direction in (1, -1):
+                        neighbor = self._simulate_motion(
+                            current,
+                            float(steer),
+                            direction,
+                            obstacles,
+                            collision_margin=0.0,
+                        )
+                        if neighbor is None:
+                            continue
+                        neighbor_chain = [*chain, neighbor]
+                        if not vehicle_collides(
+                            neighbor.x,
+                            neighbor.y,
+                            neighbor.yaw,
+                            obstacles,
+                            self.bounds,
+                            self.geometry,
+                            self.config.obstacle_margin,
+                        ):
+                            escape_candidates.append((neighbor.cost, neighbor_chain))
+                            continue
+                        next_frontier.append((neighbor.cost, neighbor_chain, neighbor))
+            if escape_candidates:
+                _, best_chain = min(escape_candidates, key=lambda item: item[0])
+                return (
+                    self._build_chain_path(start_node, best_chain),
+                    best_chain[-1],
+                )
+            next_frontier.sort(key=lambda item: item[0])
+            frontier = [(chain, node) for _, chain, node in next_frontier]
+        return None
 
     def _try_analytic_connection(
         self,
@@ -439,6 +552,20 @@ class HybridAStarPlanner:
         obstacles: list[ObstacleBox],
     ) -> PlannedPath:
         # rebuild the full route by walking backward through the search tree
+        raw_path = self._build_raw_path(closed_nodes, goal_node)
+        return smooth_path(
+            raw_path,
+            obstacles=obstacles,
+            bounds=self.bounds,
+            geometry=self.geometry,
+            config=self.config,
+        )
+
+    def _build_raw_path(
+        self,
+        closed_nodes: dict[tuple[int, int, int, int], _SearchNode],
+        goal_node: _SearchNode,
+    ) -> PlannedPath:
         reversed_x: list[float] = []
         reversed_y: list[float] = []
         reversed_yaw: list[float] = []
@@ -462,16 +589,63 @@ class HybridAStarPlanner:
         x, y, yaw, directions = self._dedupe_samples(x, y, yaw, directions)
         if len(directions) > 1:
             directions[0] = directions[1]
-        raw_path = PlannedPath(
+        return PlannedPath(
             x=x, y=y, yaw=yaw, directions=directions, cost=goal_node.cost
         )
-        return smooth_path(
-            raw_path,
-            obstacles=obstacles,
-            bounds=self.bounds,
-            geometry=self.geometry,
-            config=self.config,
+
+    def _build_chain_path(
+        self,
+        start_node: _SearchNode,
+        chain: list[_SearchNode],
+    ) -> PlannedPath:
+        x_values = [float(start_node.x)]
+        y_values = [float(start_node.y)]
+        yaw_values = [wrap_to_pi(start_node.yaw)]
+        direction_values = [int(start_node.direction)]
+        for node in chain:
+            x_values.extend(node.x_values)
+            y_values.extend(node.y_values)
+            yaw_values.extend(node.yaw_values)
+            direction_values.extend(node.directions)
+        x = np.asarray(x_values, dtype=np.float32)
+        y = np.asarray(y_values, dtype=np.float32)
+        yaw = np.asarray(yaw_values, dtype=np.float32)
+        directions = np.asarray(direction_values, dtype=np.int8)
+        x, y, yaw, directions = self._dedupe_samples(x, y, yaw, directions)
+        if len(directions) > 1:
+            directions[0] = directions[1]
+        return PlannedPath(
+            x=x,
+            y=y,
+            yaw=yaw,
+            directions=directions,
+            cost=chain[-1].cost,
         )
+
+    def _prepend_path(
+        self,
+        prefix: PlannedPath | None,
+        path: PlannedPath,
+    ) -> PlannedPath:
+        if prefix is None:
+            return path
+        drop_first = (
+            len(path.x) > 0
+            and abs(float(path.x[0] - prefix.x[-1])) < 1e-4
+            and abs(float(path.y[0] - prefix.y[-1])) < 1e-4
+            and abs(wrap_to_pi(float(path.yaw[0] - prefix.yaw[-1]))) < 1e-4
+        )
+        start_index = 1 if drop_first else 0
+        x = np.concatenate((prefix.x, path.x[start_index:])).astype(np.float32)
+        y = np.concatenate((prefix.y, path.y[start_index:])).astype(np.float32)
+        yaw = np.concatenate((prefix.yaw, path.yaw[start_index:])).astype(np.float32)
+        directions = np.concatenate(
+            (prefix.directions, path.directions[start_index:])
+        ).astype(np.int8)
+        x, y, yaw, directions = self._dedupe_samples(x, y, yaw, directions)
+        if len(directions) > 1:
+            directions[0] = directions[1]
+        return PlannedPath(x=x, y=y, yaw=yaw, directions=directions, cost=path.cost)
 
     def _dedupe_samples(
         self,
@@ -583,6 +757,11 @@ def smooth_path(
         directions=np.ones(sample_count, dtype=np.int8),
         cost=path.cost,
     )
+    max_feasible_curvature = abs(math.tan(geometry.max_steering_angle)) / max(
+        geometry.wheelbase, 1e-6
+    )
+    if _path_max_curvature(smooth_path_candidate) > max_feasible_curvature + 1e-3:
+        return path
     if path_is_collision_free(
         smooth_path_candidate,
         obstacles=obstacles,
@@ -594,39 +773,217 @@ def smooth_path(
     return path
 
 
-class PurePursuitController:
+def _path_max_curvature(path: PlannedPath) -> float:
+    if len(path.x) < 2:
+        return 0.0
+
+    segment_lengths = np.hypot(np.diff(path.x), np.diff(path.y))
+    valid_segments = segment_lengths > 1e-6
+    if not np.any(valid_segments):
+        return 0.0
+
+    yaw_deltas = np.asarray(
+        [
+            wrap_to_pi(float(path.yaw[idx + 1] - path.yaw[idx]))
+            for idx in range(len(path.yaw) - 1)
+        ],
+        dtype=np.float32,
+    )
+    curvatures = np.abs(yaw_deltas[valid_segments]) / segment_lengths[valid_segments]
+    if len(curvatures) == 0:
+        return 0.0
+    return float(np.max(curvatures))
+
+
+class KinematicMPCController:
     def __init__(
         self,
         geometry: VehicleGeometry,
     ) -> None:
         self.geometry = geometry
-        self.config = PurePursuitConfig()
+        self.config = KinematicMPCConfig()
         self._target_index = 0
+        self._steps_until_resolve = 0
+        self._cached_command = (0.0, 0.0)
+        self._cached_segment_end = 0
+        self._cached_direction = 0
+        self._last_solution: np.ndarray | None = None
+        self._last_wheel_speed = 0.0
+        self._last_steering = 0.0
 
     def reset(self) -> None:
         self._target_index = 0
+        self._steps_until_resolve = 0
+        self._cached_command = (0.0, 0.0)
+        self._cached_segment_end = 0
+        self._cached_direction = 0
+        self._last_solution = None
+        self._last_wheel_speed = 0.0
+        self._last_steering = 0.0
 
     def at_end(self, path: PlannedPath) -> bool:
         return self._target_index >= len(path.x) - 1
 
     def control(self, state: VehicleState, path: PlannedPath) -> tuple[float, float]:
-        # pick a point ahead on the route and steer toward it
-        # then picks a reasonable speed so the car slows near the end and near tight turns
-        target_index, lookahead, segment_end = self._search_target_index(state, path)
-        direction = int(path.directions[min(target_index, len(path.directions) - 1)])
-        rear_x = state.x - direction * (self.geometry.wheelbase * 0.5) * math.cos(
-            state.yaw
+        target_index, segment_end = self._search_target_index(state, path)
+        direction = int(path.directions[target_index])
+
+        if (
+            self._steps_until_resolve > 0
+            and self._cached_segment_end == segment_end
+            and self._cached_direction == direction
+        ):
+            self._steps_until_resolve -= 1
+            return self._cached_command
+
+        target_wheel_speed = self._target_wheel_speed(
+            state, path, segment_end, direction
         )
-        rear_y = state.y - direction * (self.geometry.wheelbase * 0.5) * math.sin(
-            state.yaw
+        reference = self._build_reference(
+            path=path,
+            start_index=target_index,
+            segment_end=segment_end,
+            target_speed=target_wheel_speed * self.geometry.wheel_radius,
         )
-        target_x = float(path.x[target_index])
-        target_y = float(path.y[target_index])
-        alpha = wrap_to_pi(math.atan2(target_y - rear_y, target_x - rear_x) - state.yaw)
-        steering = direction * math.atan2(
-            2.0 * self.geometry.wheelbase * math.sin(alpha),
-            max(lookahead, 1e-3),
+        wheel_speed, steering, solution = self._solve_mpc(
+            state=state,
+            direction=direction,
+            target_wheel_speed=target_wheel_speed,
+            reference=reference,
         )
+
+        self._last_solution = solution
+        self._last_wheel_speed = wheel_speed
+        self._last_steering = steering
+        self._cached_command = (wheel_speed, steering)
+        self._cached_segment_end = segment_end
+        self._cached_direction = direction
+        self._steps_until_resolve = self.config.control_interval_steps - 1
+        return self._cached_command
+
+    def _solve_mpc(
+        self,
+        state: VehicleState,
+        direction: int,
+        target_wheel_speed: float,
+        reference: list[tuple[float, float, float, float]],
+    ) -> tuple[float, float, np.ndarray]:
+        horizon_steps = self.config.horizon_steps
+        if direction >= 0:
+            wheel_bounds = (0.0, self.config.max_forward_wheel_speed)
+        else:
+            wheel_bounds = (-self.config.max_reverse_wheel_speed, 0.0)
+        bounds = [wheel_bounds] * horizon_steps + [
+            (-self.geometry.max_steering_angle, self.geometry.max_steering_angle)
+        ] * horizon_steps
+
+        initial_guess = self._initial_guess(
+            target_wheel_speed=target_wheel_speed,
+            horizon_steps=horizon_steps,
+        )
+        objective = lambda controls: self._objective(
+            controls=controls,
+            state=state,
+            reference=reference,
+            target_wheel_speed=target_wheel_speed,
+        )
+        result = minimize(
+            objective,
+            initial_guess,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": self.config.optimizer_maxiter},
+        )
+        solution = (
+            np.asarray(result.x, dtype=np.float64)
+            if np.all(np.isfinite(result.x))
+            else initial_guess
+        )
+        wheel_speed = float(np.clip(solution[0], *wheel_bounds))
+        steering = float(
+            np.clip(
+                solution[horizon_steps],
+                -self.geometry.max_steering_angle,
+                self.geometry.max_steering_angle,
+            )
+        )
+        return (wheel_speed, steering, solution)
+
+    def _objective(
+        self,
+        controls: np.ndarray,
+        state: VehicleState,
+        reference: list[tuple[float, float, float, float]],
+        target_wheel_speed: float,
+    ) -> float:
+        horizon_steps = self.config.horizon_steps
+        wheel_speeds = controls[:horizon_steps]
+        steerings = controls[horizon_steps:]
+
+        x = state.x
+        y = state.y
+        yaw = state.yaw
+        applied_wheel_speed = state.speed / max(self.geometry.wheel_radius, 1e-6)
+        previous_wheel_speed = self._last_wheel_speed
+        previous_steering = self._last_steering
+        cost = 0.0
+
+        for step in range(horizon_steps):
+            x, y, yaw, applied_wheel_speed = self._rollout_interval(
+                x=x,
+                y=y,
+                yaw=yaw,
+                applied_wheel_speed=applied_wheel_speed,
+                wheel_speed_command=float(wheel_speeds[step]),
+                steering=float(steerings[step]),
+            )
+            reference_x, reference_y, reference_yaw, reference_speed = reference[step]
+            position_error = (x - reference_x) ** 2 + (y - reference_y) ** 2
+            yaw_error = wrap_to_pi(yaw - reference_yaw)
+            speed = applied_wheel_speed * self.geometry.wheel_radius
+            speed_error = speed - reference_speed
+
+            position_cost = (
+                self.config.terminal_position_cost
+                if step == horizon_steps - 1
+                else self.config.position_cost
+            )
+            yaw_cost = (
+                self.config.terminal_yaw_cost
+                if step == horizon_steps - 1
+                else self.config.yaw_cost
+            )
+            cost += position_cost * position_error
+            cost += yaw_cost * yaw_error * yaw_error
+            cost += self.config.speed_cost * speed_error * speed_error
+            cost += (
+                self.config.wheel_speed_cost
+                * (wheel_speeds[step] - target_wheel_speed) ** 2
+            )
+            cost += (
+                self.config.wheel_speed_rate_cost
+                * (wheel_speeds[step] - previous_wheel_speed) ** 2
+            )
+            cost += self.config.steering_cost * steerings[step] * steerings[step]
+            cost += (
+                self.config.steering_rate_cost
+                * (steerings[step] - previous_steering) ** 2
+            )
+
+            previous_wheel_speed = float(wheel_speeds[step])
+            previous_steering = float(steerings[step])
+
+        return float(cost)
+
+    def _rollout_interval(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        applied_wheel_speed: float,
+        wheel_speed_command: float,
+        steering: float,
+    ) -> tuple[float, float, float, float]:
         steering = float(
             np.clip(
                 steering,
@@ -634,7 +991,99 @@ class PurePursuitController:
                 self.geometry.max_steering_angle,
             )
         )
+        for _ in range(self.config.control_interval_steps):
+            applied_wheel_speed += self.config.actuator_response * (
+                wheel_speed_command - applied_wheel_speed
+            )
+            speed = applied_wheel_speed * self.geometry.wheel_radius
+            x += speed * math.cos(yaw) * self.config.sim_dt
+            y += speed * math.sin(yaw) * self.config.sim_dt
+            yaw = wrap_to_pi(
+                yaw
+                + speed
+                / max(self.geometry.wheelbase, 1e-6)
+                * math.tan(steering)
+                * self.config.sim_dt
+            )
+        return (x, y, yaw, applied_wheel_speed)
 
+    def _initial_guess(
+        self,
+        target_wheel_speed: float,
+        horizon_steps: int,
+    ) -> np.ndarray:
+        if (
+            self._last_solution is not None
+            and len(self._last_solution) == 2 * horizon_steps
+        ):
+            previous_wheels = self._last_solution[:horizon_steps]
+            previous_steerings = self._last_solution[horizon_steps:]
+            wheel_guess = np.concatenate((previous_wheels[1:], previous_wheels[-1:]))
+            steering_guess = np.concatenate(
+                (previous_steerings[1:], previous_steerings[-1:])
+            )
+        else:
+            wheel_guess = np.full(horizon_steps, target_wheel_speed, dtype=np.float64)
+            steering_guess = np.full(
+                horizon_steps, self._last_steering, dtype=np.float64
+            )
+        return np.concatenate((wheel_guess, steering_guess))
+
+    def _build_reference(
+        self,
+        path: PlannedPath,
+        start_index: int,
+        segment_end: int,
+        target_speed: float,
+    ) -> list[tuple[float, float, float, float]]:
+        reference: list[tuple[float, float, float, float]] = []
+        reference_index = start_index
+        step_distance = max(
+            self.config.reference_spacing,
+            abs(target_speed) * self.config.sim_dt * self.config.control_interval_steps,
+        )
+        for _ in range(self.config.horizon_steps):
+            reference_index = self._advance_reference_index(
+                path=path,
+                start_index=reference_index,
+                end_index=segment_end,
+                step_distance=step_distance,
+            )
+            reference.append(
+                (
+                    float(path.x[reference_index]),
+                    float(path.y[reference_index]),
+                    float(path.yaw[reference_index]),
+                    float(target_speed),
+                )
+            )
+        return reference
+
+    def _advance_reference_index(
+        self,
+        path: PlannedPath,
+        start_index: int,
+        end_index: int,
+        step_distance: float,
+    ) -> int:
+        index = start_index
+        remaining = step_distance
+        while index < end_index and remaining > 0.0:
+            segment_distance = math.hypot(
+                float(path.x[index + 1] - path.x[index]),
+                float(path.y[index + 1] - path.y[index]),
+            )
+            index += 1
+            remaining -= max(segment_distance, 1e-4)
+        return index
+
+    def _target_wheel_speed(
+        self,
+        state: VehicleState,
+        path: PlannedPath,
+        segment_end: int,
+        direction: int,
+    ) -> float:
         distance_to_goal = math.hypot(
             float(path.x[-1] - state.x), float(path.y[-1] - state.y)
         )
@@ -651,31 +1100,16 @@ class PurePursuitController:
             if distance_to_cusp < self.config.cusp_slowdown_distance:
                 target_speed = min(target_speed, self.config.slow_speed)
         target_speed *= direction
-        target_speed *= max(
-            0.45,
-            1.0 - 0.35 * abs(steering) / max(self.geometry.max_steering_angle, 1e-6),
-        )
-        speed_error = target_speed - state.speed
-        wheel_speed = (
-            target_speed + self.config.speed_gain * speed_error
-        ) / self.geometry.wheel_radius
+        wheel_speed = target_speed / max(self.geometry.wheel_radius, 1e-6)
         if direction >= 0:
-            wheel_speed = float(
-                np.clip(wheel_speed, 0.0, self.config.max_forward_wheel_speed)
-            )
-        else:
-            wheel_speed = float(
-                np.clip(wheel_speed, -self.config.max_reverse_wheel_speed, 0.0)
-            )
-        return wheel_speed, steering
+            return float(np.clip(wheel_speed, 0.0, self.config.max_forward_wheel_speed))
+        return float(np.clip(wheel_speed, -self.config.max_reverse_wheel_speed, 0.0))
 
     def _search_target_index(
         self,
         state: VehicleState,
         path: PlannedPath,
-    ) -> tuple[int, float, int]:
-        # keep moving the target forward as the car progresses along the route
-        # if the route switches direction, it waits until the car is close to the switch point
+    ) -> tuple[int, int]:
         if self._target_index >= len(path.x):
             self._target_index = len(path.x) - 1
 
@@ -684,12 +1118,7 @@ class PurePursuitController:
                 path.directions[min(self._target_index, len(path.directions) - 1)]
             )
             segment_end = self._segment_end_index(path, self._target_index)
-            rear_x = state.x - search_direction * (
-                self.geometry.wheelbase * 0.5
-            ) * math.cos(state.yaw)
-            rear_y = state.y - search_direction * (
-                self.geometry.wheelbase * 0.5
-            ) * math.sin(state.yaw)
+            rear_x, rear_y = self._tracking_point(state, search_direction)
 
             nearest_index = self._target_index
             nearest_distance = math.hypot(
@@ -721,26 +1150,16 @@ class PurePursuitController:
                 and distance_to_cusp <= self.config.cusp_switch_distance
             ):
                 self._target_index = segment_end + 1
+                self._steps_until_resolve = 0
+                self._last_solution = None
                 continue
 
-            lookahead = float(
-                np.clip(
-                    self.config.lookahead_gain * abs(state.speed)
-                    + self.config.min_lookahead,
-                    self.config.min_lookahead,
-                    self.config.max_lookahead,
-                )
-            )
+            return self._target_index, segment_end
 
-            while self._target_index + 1 <= segment_end:
-                distance = math.hypot(
-                    float(path.x[self._target_index] - rear_x),
-                    float(path.y[self._target_index] - rear_y),
-                )
-                if distance >= lookahead:
-                    break
-                self._target_index += 1
-            return self._target_index, lookahead, segment_end
+    def _tracking_point(
+        self, state: VehicleState, direction: int
+    ) -> tuple[float, float]:
+        return (state.x, state.y)
 
     def _segment_end_index(self, path: PlannedPath, start_index: int) -> int:
         direction = int(path.directions[start_index])
@@ -761,7 +1180,7 @@ class TeacherPlanner:
     ) -> None:
         self.geometry = geometry
         self.bounds = bounds
-        self.controller = PurePursuitController(geometry)
+        self.controller = KinematicMPCController(geometry)
         self.planner = HybridAStarPlanner(geometry, bounds)
         self.planner_config = self.planner.config
         self.path: PlannedPath | None = None
@@ -784,19 +1203,20 @@ class TeacherPlanner:
             <= self.planner_config.goal_tolerance
         ):
             return (0.0, 0.0)
+        planner_state = self._planner_state(state)
 
-        if self.path is None or self._needs_replan(state, goal_xy):
-            self.path = self.planner.plan(state, goal_xy, obstacles)
+        if self.path is None or self._needs_replan(planner_state, goal_xy):
+            self.path = self.planner.plan(planner_state, goal_xy, obstacles)
             self.goal_xy = goal_xy.copy()
             self.controller.reset()
 
         if self.path is None:
             raise RuntimeError(
-                f"could not find a path from ({state.x:.2f}, {state.y:.2f}) "
+                f"could not find a path from ({planner_state.x:.2f}, {planner_state.y:.2f}) "
                 f"to ({float(goal_xy[0]):.2f}, {float(goal_xy[1]):.2f})."
             )
 
-        throttle, steering = self.controller.control(state, self.path)
+        throttle, steering = self.controller.control(planner_state, self.path)
         return (throttle, steering)
 
     def _needs_replan(self, state: VehicleState, goal_xy: np.ndarray) -> bool:
@@ -806,4 +1226,14 @@ class TeacherPlanner:
             or float(np.linalg.norm(goal_xy - self.goal_xy)) > 1e-3
             or self.path.distance_to_point(state.x, state.y)
             > self.planner_config.replan_distance
+        )
+
+    def _planner_state(self, state: VehicleState) -> VehicleState:
+        if abs(self.geometry.rear_axle_offset) < 1e-6:
+            return state
+        return VehicleState(
+            x=state.x - self.geometry.rear_axle_offset * math.cos(state.yaw),
+            y=state.y - self.geometry.rear_axle_offset * math.sin(state.yaw),
+            yaw=state.yaw,
+            speed=state.speed,
         )

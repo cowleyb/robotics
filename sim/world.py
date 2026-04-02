@@ -36,6 +36,8 @@ WHEELBASE = _CAR_GEOM.wheelbase
 MIN_TURNING_RADIUS = _CAR_GEOM.min_turning_radius
 FRONT_TRACK = _CAR_GEOM.front_track
 REAR_TRACK = _CAR_GEOM.rear_track
+REAR_AXLE_OFFSET = abs(_CAR_GEOM.rear_axle_x)
+PLANNER_COLLISION_CENTER_OFFSET = 0.5 * WHEELBASE
 
 
 class World:
@@ -74,7 +76,14 @@ class World:
         x_range: tuple[float, float],
         y_range: tuple[float, float],
         z: float,
+        spawned_objects: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ]
+        | None = None,
     ) -> tuple[float, float, float]:
+        existing_objects = (
+            self.spawned_objects if spawned_objects is None else spawned_objects
+        )
         while True:
             position = (
                 self.rng.uniform(*x_range),
@@ -83,21 +92,99 @@ class World:
             )
             overlap = any(
                 self._check_overlap(position, size, existing_pos, existing_size)
-                for existing_pos, existing_size in self.spawned_objects
+                for existing_pos, existing_size in existing_objects
             )
             if not overlap:
                 return position
 
-    def _build_world(self, seed: int) -> None:
-        self.seed = int(seed)
-        self.rng = random.Random(self.seed)
-        if gs.backend is None:
-            gs.init(backend=self.backend)
-        elif self.backend != gs.gpu and gs.backend != self.backend:
-            raise RuntimeError(
-                f"Genesis already initialized with backend {gs.backend}, "
-                f"cannot create World with backend {self.backend}."
+    def _make_teacher_planner(self) -> TeacherPlanner:
+        return TeacherPlanner(
+            geometry=VehicleGeometry(
+                wheelbase=WHEELBASE,
+                max_steering_angle=MAX_STEERING_ANGLE,
+                length=float(self.spawn_car_size[0]),
+                width=float(self.spawn_car_size[1]),
+                wheel_radius=float(_CAR_GEOM.wheel_radius),
+                collision_center_offset=float(PLANNER_COLLISION_CENTER_OFFSET),
+                rear_axle_offset=float(REAR_AXLE_OFFSET),
+            ),
+            bounds=EnvironmentBounds(
+                min_x=-(SPAWN_RANGE + WORLD_MARGIN),
+                max_x=SPAWN_RANGE + WORLD_MARGIN,
+                min_y=-(SPAWN_RANGE + WORLD_MARGIN),
+                max_y=SPAWN_RANGE + WORLD_MARGIN,
+            ),
+        )
+
+    def _sample_layout(
+        self,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        list[tuple[float, float, float]],
+        list[ObstacleBox],
+    ]:
+        spawned_objects: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ] = []
+        car_pos = (
+            self.rng.uniform(-SPAWN_RANGE, 0.0),
+            self.rng.uniform(-SPAWN_RANGE, 0.0),
+            _CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
+        )
+        spawned_objects.append((car_pos, self.spawn_car_size))
+
+        goal_pos = self._sample_spawn_position(
+            size=self.goal_size,
+            x_range=(0.0, SPAWN_RANGE),
+            y_range=(0.0, SPAWN_RANGE),
+            z=GOAL_HEIGHT,
+            spawned_objects=spawned_objects,
+        )
+        spawned_objects.append((goal_pos, self.goal_size))
+
+        obstacle_positions = []
+        for _ in range(self.obstacle_count):
+            obstacle_pos = self._sample_spawn_position(
+                size=self.obstacle_size,
+                x_range=(-SPAWN_RANGE, SPAWN_RANGE),
+                y_range=(-SPAWN_RANGE, SPAWN_RANGE),
+                z=OBSTACLE_HEIGHT,
+                spawned_objects=spawned_objects,
             )
+            spawned_objects.append((obstacle_pos, self.obstacle_size))
+            obstacle_positions.append(obstacle_pos)
+
+        teacher_obstacles = [
+            ObstacleBox(
+                center_x=float(position[0]),
+                center_y=float(position[1]),
+                size_x=float(self.obstacle_size[0]),
+                size_y=float(self.obstacle_size[1]),
+            )
+            for position in obstacle_positions
+        ]
+        return (
+            car_pos,
+            goal_pos,
+            obstacle_positions,
+            teacher_obstacles,
+        )
+
+    def _build_scene_from_layout(
+        self,
+        car_pos: tuple[float, float, float],
+        goal_pos: tuple[float, float, float],
+        obstacle_positions: list[tuple[float, float, float]],
+        teacher_obstacles: list[ObstacleBox],
+        teacher_planner: TeacherPlanner,
+    ) -> None:
+        self.car_pos = car_pos
+        self.goal_pos = goal_pos
+        self.obstacle_positions = list(obstacle_positions)
+        self.teacher_obstacles = list(teacher_obstacles)
+        self.teacher_planner = teacher_planner
+        self.spawned_objects = [(self.car_pos, self.spawn_car_size), (self.goal_pos, self.goal_size)]
 
         self.scene = gs.Scene(
             show_viewer=self.show_viewer,
@@ -112,24 +199,6 @@ class World:
 
         self.scene.add_entity(
             gs.morphs.Plane(), surface=gs.surfaces.Default(color=(0.18, 0.24, 0.18))
-        )
-
-        self.spawned_objects = []
-        self.car_size = _CAR_GEOM.base_size
-        self.spawn_car_size = (
-            max(
-                float(self.car_size[0]), float(WHEELBASE + 2.0 * _CAR_GEOM.wheel_radius)
-            ),
-            max(
-                float(self.car_size[1]),
-                float(max(FRONT_TRACK, REAR_TRACK) + _CAR_GEOM.wheel_width),
-            ),
-            float(self.car_size[2]),
-        )
-        self.car_pos = (
-            self.rng.uniform(-SPAWN_RANGE, 0.0),
-            self.rng.uniform(-SPAWN_RANGE, 0.0),
-            _CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
         )
 
         self.car = self.scene.add_entity(
@@ -174,15 +243,6 @@ class World:
             fov=90,
             GUI=False,
         )
-        self.spawned_objects.append((self.car_pos, self.spawn_car_size))
-
-        self.goal_size = GOAL_SIZE
-        self.goal_pos = self._sample_spawn_position(
-            size=self.goal_size,
-            x_range=(0.0, SPAWN_RANGE),
-            y_range=(0.0, SPAWN_RANGE),
-            z=GOAL_HEIGHT,
-        )
 
         self.goal_zone = self.scene.add_entity(
             gs.morphs.Box(
@@ -194,19 +254,9 @@ class World:
             surface=gs.surfaces.Plastic(color=(1.0, 1.0, 0.0)),
             name="goal_zone",
         )
-        self.spawned_objects.append((self.goal_pos, self.goal_size))
 
         self.obstacles = []
-        self.obstacle_size = OBSTACLE_SIZE
-        self.obstacle_positions = []
-        for i in range(self.obstacle_count):
-            obs_pos = self._sample_spawn_position(
-                size=self.obstacle_size,
-                x_range=(-SPAWN_RANGE, SPAWN_RANGE),
-                y_range=(-SPAWN_RANGE, SPAWN_RANGE),
-                z=OBSTACLE_HEIGHT,
-            )
-
+        for i, obs_pos in enumerate(self.obstacle_positions):
             obstacle = self.scene.add_entity(
                 gs.morphs.Box(
                     pos=obs_pos,
@@ -217,35 +267,42 @@ class World:
                 name=f"obstacle_{i}",
             )
             self.spawned_objects.append((obs_pos, self.obstacle_size))
-            self.obstacle_positions.append(obs_pos)
             self.obstacles.append(obstacle)
 
-        self.teacher_obstacles = [
-            ObstacleBox(
-                center_x=float(position[0]),
-                center_y=float(position[1]),
-                size_x=float(self.obstacle_size[0]),
-                size_y=float(self.obstacle_size[1]),
-            )
-            for position in self.obstacle_positions
-        ]
-        self.teacher_planner = TeacherPlanner(
-            geometry=VehicleGeometry(
-                wheelbase=WHEELBASE,
-                max_steering_angle=MAX_STEERING_ANGLE,
-                length=float(self.spawn_car_size[0]),
-                width=float(self.spawn_car_size[1]),
-                wheel_radius=float(_CAR_GEOM.wheel_radius),
-            ),
-            bounds=EnvironmentBounds(
-                min_x=-(SPAWN_RANGE + WORLD_MARGIN),
-                max_x=SPAWN_RANGE + WORLD_MARGIN,
-                min_y=-(SPAWN_RANGE + WORLD_MARGIN),
-                max_y=SPAWN_RANGE + WORLD_MARGIN,
-            ),
-        )
-
         self.scene.build()
+
+    def _build_world(self, seed: int) -> None:
+        self.seed = int(seed)
+        self.rng = random.Random(self.seed)
+        if gs.backend is None:
+            gs.init(backend=self.backend)
+        elif self.backend != gs.gpu and gs.backend != self.backend:
+            raise RuntimeError(
+                f"Genesis already initialized with backend {gs.backend}, "
+                f"cannot create World with backend {self.backend}."
+            )
+
+        self.car_size = _CAR_GEOM.base_size
+        self.spawn_car_size = (
+            max(
+                float(self.car_size[0]), float(WHEELBASE + 2.0 * _CAR_GEOM.wheel_radius)
+            ),
+            max(
+                float(self.car_size[1]),
+                float(max(FRONT_TRACK, REAR_TRACK) + _CAR_GEOM.wheel_width),
+            ),
+            float(self.car_size[2]),
+        )
+        self.goal_size = GOAL_SIZE
+        self.obstacle_size = OBSTACLE_SIZE
+        car_pos, goal_pos, obstacle_positions, teacher_obstacles = self._sample_layout()
+        self._build_scene_from_layout(
+            car_pos=car_pos,
+            goal_pos=goal_pos,
+            obstacle_positions=obstacle_positions,
+            teacher_obstacles=teacher_obstacles,
+            teacher_planner=self._make_teacher_planner(),
+        )
 
     def _yaw_from_quat(self, quat: np.ndarray) -> float:
         w, x, y, z = quat

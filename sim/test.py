@@ -28,7 +28,9 @@ def normalize_action(throttle: float, steering: float) -> dict[str, float]:
     }
 
 
-def rotate_world_vector_to_car_frame(vector_xy: np.ndarray, car_quaternion: np.ndarray) -> np.ndarray:
+def rotate_world_vector_to_car_frame(
+    vector_xy: np.ndarray, car_quaternion: np.ndarray
+) -> np.ndarray:
     w, x, y, z = car_quaternion
     yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     cos_yaw = np.cos(yaw)
@@ -251,6 +253,10 @@ def main() -> None:
         if args.manual:
             register_keyboard_controls(world, control_state)
 
+        reached_goal = False
+        hit_obstacle = False
+        timed_out = False
+        planning_error: RuntimeError | None = None
         while True:
             if args.manual:
                 throttle = (
@@ -261,7 +267,15 @@ def main() -> None:
                     control_state["left"] - control_state["right"]
                 )
             else:
-                throttle, steering = world.heuristic_action()
+                try:
+                    throttle, steering = world.heuristic_action()
+                except RuntimeError as exc:
+                    planning_error = exc
+                    print(
+                        f"episode {episode_idx + 1}: planner failed at step {step_count} "
+                        f"for seed {world.seed}: {exc}"
+                    )
+                    break
             normalized_action = normalize_action(throttle=throttle, steering=steering)
             world.last_action = np.array(
                 [normalized_action["throttle"], normalized_action["steering"]],
@@ -292,6 +306,10 @@ def main() -> None:
                 break
 
         print(f"episode {episode_idx + 1}: collected {len(trajectory)} samples")
+        if planning_error is not None:
+            failed_seeds.append(world.seed)
+            print(f"episode {episode_idx + 1}: skipped saving planner failure")
+            continue
         if not reached_goal:
             failed_seeds.append(world.seed)
             print(f"episode {episode_idx + 1}: skipped saving unsuccessful rollout")
