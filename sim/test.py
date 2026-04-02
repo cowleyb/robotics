@@ -188,81 +188,92 @@ def main() -> None:
         "--seed",
         default=None,
     )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=1,
+    )
     args = parser.parse_args()
 
-    if args.seed is not None:
-        seed = int(args.seed)
-    else:
-        seed = int(secrets.randbelow(2**31 - 1))
+    if args.episodes < 1:
+        raise ValueError("--episodes must be at least 1")
 
-    world = World(
-        seed=seed,
-        instruction=args.instruction,
-        show_viewer=args.show_viewer,
-    )
-
-    observation = world.get_observation()
-    print(observation)
-    print(f"seed: {world.seed}")
-
-    step_count = 0
-    trajectory = []
-    control_state = {
-        "forward": 0.0,
-        "reverse": 0.0,
-        "left": 0.0,
-        "right": 0.0,
-    }
-
-    if args.manual:
-        register_keyboard_controls(world, control_state)
-
-    while True:
-        if args.manual:
-            throttle = (
-                DRIVE_LIMITS.max_forward_wheel_speed * control_state["forward"]
-                - DRIVE_LIMITS.max_reverse_wheel_speed * control_state["reverse"]
-            )
-            steering = MAX_STEERING_ANGLE * (
-                control_state["left"] - control_state["right"]
-            )
+    base_seed = int(args.seed) if args.seed is not None else None
+    output_path = None
+    for episode_idx in range(args.episodes):
+        if base_seed is not None:
+            seed = base_seed + episode_idx
         else:
-            throttle, steering = world.heuristic_action()
-        normalized_action = normalize_action(throttle=throttle, steering=steering)
-        world.last_action = np.array(
-            [normalized_action["throttle"], normalized_action["steering"]],
-            dtype=np.float32,
-        )
-        world.move_car(throttle=throttle, steering=steering)
-        next_observation = world.step()
-        step_count += 1
-        reached_goal = world.goal_reached()
-        hit_obstacle = world.hit_obstacle()
-        timed_out = step_count >= 5000
-        trajectory.append(
-            build_lerobot_frame(
-                observation=observation,
-                action=normalized_action,
-                instruction=world.instruction,
-            )
-        )
-        observation = next_observation
-        if reached_goal:
-            print(f"goal reached at step {step_count}")
-            break
-        if hit_obstacle:
-            print(f"hit obstacle at step {step_count}")
-            break
-        if timed_out:
-            print(f"timeout at step {step_count}")
-            break
+            seed = int(secrets.randbelow(2**31 - 1))
 
-    print(f"collected {len(trajectory)} samples")
-    output_path = save_episode(
-        trajectory=trajectory,
-    )
+        world = World(
+            seed=seed,
+            instruction=args.instruction,
+            show_viewer=args.show_viewer,
+        )
+
+        observation = world.get_observation()
+        print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
+
+        step_count = 0
+        trajectory = []
+        control_state = {
+            "forward": 0.0,
+            "reverse": 0.0,
+            "left": 0.0,
+            "right": 0.0,
+        }
+
+        if args.manual:
+            register_keyboard_controls(world, control_state)
+
+        while True:
+            if args.manual:
+                throttle = (
+                    DRIVE_LIMITS.max_forward_wheel_speed * control_state["forward"]
+                    - DRIVE_LIMITS.max_reverse_wheel_speed * control_state["reverse"]
+                )
+                steering = MAX_STEERING_ANGLE * (
+                    control_state["left"] - control_state["right"]
+                )
+            else:
+                throttle, steering = world.heuristic_action()
+            normalized_action = normalize_action(throttle=throttle, steering=steering)
+            world.last_action = np.array(
+                [normalized_action["throttle"], normalized_action["steering"]],
+                dtype=np.float32,
+            )
+            world.move_car(throttle=throttle, steering=steering)
+            next_observation = world.step()
+            step_count += 1
+            reached_goal = world.goal_reached()
+            hit_obstacle = world.hit_obstacle()
+            timed_out = step_count >= 5000
+            trajectory.append(
+                build_lerobot_frame(
+                    observation=observation,
+                    action=normalized_action,
+                    instruction=world.instruction,
+                )
+            )
+            observation = next_observation
+            if reached_goal:
+                print(f"episode {episode_idx + 1}: goal reached at step {step_count}")
+                break
+            if hit_obstacle:
+                print(f"episode {episode_idx + 1}: hit obstacle at step {step_count}")
+                break
+            if timed_out:
+                print(f"episode {episode_idx + 1}: timeout at step {step_count}")
+                break
+
+        print(f"episode {episode_idx + 1}: collected {len(trajectory)} samples")
+        output_path = save_episode(
+            trajectory=trajectory,
+        )
+        print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
+
     print(f"saved LeRobot dataset: {output_path}")
-    print(f"seed: {world.seed}")
 
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ class PlannerConfig:
     max_iterations: int = 15000  # stop searching after this many tries
     goal_tolerance: float = 0.28  # close enough to the goal counts as arrived
     analytic_expansion_distance: float = 1.0  # when close, try to connect in one go
-    obstacle_margin: float = 0.06  # extra space around obstacles
+    obstacle_margin: float = 0.10  # extra space around obstacles
     steer_cost: float = 0.35  # for turns
     steer_change_cost: float = 0.6  # for wheel back and forth
     reverse_cost: float = 2.0
@@ -87,17 +87,17 @@ class PlannerConfig:
 
 @dataclass(frozen=True)
 class PurePursuitConfig:
-    lookahead_gain: float = 0.55  # faster speed looks further ahead
-    min_lookahead: float = 0.35  # do not look too close even at low speed
-    max_lookahead: float = 1.0  # do not look too far even at high speed
+    lookahead_gain: float = 0.4  # faster speed looks further ahead
+    min_lookahead: float = 0.25  # do not look too close even at low speed
+    max_lookahead: float = 0.8  # do not look too far even at high speed
     nominal_speed: float = 1.0  # normal cruising speed
-    slow_speed: float = 0.4  # careful speed near tricky spots
+    slow_speed: float = 0.35  # careful speed near tricky spots
     goal_slowdown_distance: float = 0.8  # start slowing as the car gets near the goal
     cusp_slowdown_distance: float = 0.45  # slow near a forward to reverse switch
     cusp_switch_distance: float = 0.12  # how close before the switch is accepted
     speed_gain: float = 0.75  # how strongly this corrects speed errors
-    max_forward_wheel_speed: float = 15.0
-    max_reverse_wheel_speed: float = 5.0
+    max_forward_wheel_speed: float = 20.0
+    max_reverse_wheel_speed: float = 8.0
 
 
 @dataclass
@@ -227,11 +227,10 @@ class HybridAStarPlanner:
         self,
         geometry: VehicleGeometry,
         bounds: EnvironmentBounds,
-        config: PlannerConfig | None = None,
     ) -> None:
         self.geometry = geometry
         self.bounds = bounds
-        self.config = PlannerConfig() if config is None else config
+        self.config = PlannerConfig()
         self._steer_values = np.unique(
             np.append(
                 np.linspace(
@@ -599,10 +598,9 @@ class PurePursuitController:
     def __init__(
         self,
         geometry: VehicleGeometry,
-        config: PurePursuitConfig | None = None,
     ) -> None:
         self.geometry = geometry
-        self.config = PurePursuitConfig() if config is None else config
+        self.config = PurePursuitConfig()
         self._target_index = 0
 
     def reset(self) -> None:
@@ -760,16 +758,12 @@ class TeacherPlanner:
         self,
         geometry: VehicleGeometry,
         bounds: EnvironmentBounds,
-        planner_config: PlannerConfig | None = None,
-        controller_config: PurePursuitConfig | None = None,
     ) -> None:
         self.geometry = geometry
         self.bounds = bounds
-        self.planner_config = (
-            PlannerConfig() if planner_config is None else planner_config
-        )
-        self.controller = PurePursuitController(geometry, controller_config)
-        self.planner = HybridAStarPlanner(geometry, bounds, self.planner_config)
+        self.controller = PurePursuitController(geometry)
+        self.planner = HybridAStarPlanner(geometry, bounds)
+        self.planner_config = self.planner.config
         self.path: PlannedPath | None = None
         self.goal_xy: np.ndarray | None = None
 
@@ -785,6 +779,12 @@ class TeacherPlanner:
         obstacles: list[ObstacleBox],
     ) -> tuple[float, float]:
         goal_xy = np.asarray(goal_xy, dtype=np.float32)
+        if (
+            math.hypot(float(goal_xy[0] - state.x), float(goal_xy[1] - state.y))
+            <= self.planner_config.goal_tolerance
+        ):
+            return (0.0, 0.0)
+
         if self.path is None or self._needs_replan(state, goal_xy):
             self.path = self.planner.plan(state, goal_xy, obstacles)
             self.goal_xy = goal_xy.copy()
@@ -796,13 +796,6 @@ class TeacherPlanner:
                 f"to ({float(goal_xy[0]):.2f}, {float(goal_xy[1]):.2f})."
             )
 
-        # check if close enough to goal stop dirving
-        if (
-            math.hypot(float(goal_xy[0] - state.x), float(goal_xy[1] - state.y))
-            <= self.planner_config.goal_tolerance
-        ):
-            return (0.0, 0.0)
-
         throttle, steering = self.controller.control(state, self.path)
         return (throttle, steering)
 
@@ -813,5 +806,4 @@ class TeacherPlanner:
             or float(np.linalg.norm(goal_xy - self.goal_xy)) > 1e-3
             or self.path.distance_to_point(state.x, state.y)
             > self.planner_config.replan_distance
-            or self.controller.at_end(self.path)
         )

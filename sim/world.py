@@ -8,8 +8,6 @@ from sim.control_limits import DEFAULT_DRIVE_LIMITS
 from sim.path_planning import (
     EnvironmentBounds,
     ObstacleBox,
-    PlannerConfig,
-    PurePursuitConfig,
     TeacherPlanner,
     VehicleGeometry,
     VehicleState,
@@ -244,13 +242,6 @@ class World:
                 max_x=SPAWN_RANGE + WORLD_MARGIN,
                 min_y=-(SPAWN_RANGE + WORLD_MARGIN),
                 max_y=SPAWN_RANGE + WORLD_MARGIN,
-            ),
-            planner_config=PlannerConfig(obstacle_margin=0.10),
-            controller_config=PurePursuitConfig(
-                nominal_speed=1.8,
-                slow_speed=0.6,
-                max_forward_wheel_speed=DRIVE_LIMITS.max_forward_wheel_speed,
-                max_reverse_wheel_speed=DRIVE_LIMITS.max_reverse_wheel_speed,
             ),
         )
 
