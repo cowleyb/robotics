@@ -28,6 +28,20 @@ def normalize_action(throttle: float, steering: float) -> dict[str, float]:
     }
 
 
+def rotate_world_vector_to_car_frame(vector_xy: np.ndarray, car_quaternion: np.ndarray) -> np.ndarray:
+    w, x, y, z = car_quaternion
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    cos_yaw = np.cos(yaw)
+    sin_yaw = np.sin(yaw)
+    return np.asarray(
+        [
+            cos_yaw * vector_xy[0] + sin_yaw * vector_xy[1],
+            -sin_yaw * vector_xy[0] + cos_yaw * vector_xy[1],
+        ],
+        dtype=np.float32,
+    )
+
+
 def save_episode(
     trajectory: list[dict[str, object]],
 ) -> Path:
@@ -80,14 +94,22 @@ def build_lerobot_frame(
     action: dict[str, float],
     instruction: str,
 ) -> dict[str, object]:
-    goal_delta = np.asarray(
+    goal_delta_world = np.asarray(
         observation["goal_position"][:2] - observation["car_position"][:2],
         dtype=np.float32,
+    )
+    goal_delta = rotate_world_vector_to_car_frame(
+        goal_delta_world,
+        np.asarray(observation["car_quaternion"], dtype=np.float32),
+    )
+    car_velocity = rotate_world_vector_to_car_frame(
+        np.asarray(observation["car_linear_velocity"][:2], dtype=np.float32),
+        np.asarray(observation["car_quaternion"], dtype=np.float32),
     )
     observation_state = np.concatenate(
         (
             goal_delta,
-            np.asarray(observation["car_linear_velocity"][:2], dtype=np.float32),
+            car_velocity,
             np.asarray(observation["steering_position"], dtype=np.float32),
             np.asarray(observation["last_action"], dtype=np.float32),
         ),
@@ -200,6 +222,8 @@ def main() -> None:
 
     base_seed = int(args.seed) if args.seed is not None else None
     output_path = None
+    saved_episodes = 0
+    failed_seeds = []
     for episode_idx in range(args.episodes):
         if base_seed is not None:
             seed = base_seed + episode_idx
@@ -268,12 +292,22 @@ def main() -> None:
                 break
 
         print(f"episode {episode_idx + 1}: collected {len(trajectory)} samples")
+        if not reached_goal:
+            failed_seeds.append(world.seed)
+            print(f"episode {episode_idx + 1}: skipped saving unsuccessful rollout")
+            continue
+
         output_path = save_episode(
             trajectory=trajectory,
         )
+        saved_episodes += 1
         print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
 
-    print(f"saved LeRobot dataset: {output_path}")
+    print(f"saved {saved_episodes}/{args.episodes} successful episodes")
+    if failed_seeds:
+        print(f"failed seeds: {failed_seeds}")
+    if output_path is not None:
+        print(f"saved LeRobot dataset: {output_path}")
 
 
 if __name__ == "__main__":
