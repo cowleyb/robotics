@@ -57,8 +57,8 @@ class PlannedPath:
 
     def distance_to_point(self, x: float, y: float) -> float:
         # returns the closest distance from the car to the planned route
-        dx = self.x - float(x)
-        dy = self.y - float(y)
+        dx = self.x - x
+        dy = self.y - y
         return float(np.min(np.hypot(dx, dy)))
 
 
@@ -407,8 +407,10 @@ class HybridAStarPlanner:
 
         goal_heading = math.atan2(goal_dy, goal_dx)
         alpha = wrap_to_pi(goal_heading - current.yaw)
-        direction = 1 if abs(alpha) <= math.pi * 0.5 else -1
-        if direction < 0:
+        if abs(alpha) <= math.pi * 0.5:
+            direction = 1
+        else:
+            direction = -1
             alpha = wrap_to_pi(goal_heading + math.pi - current.yaw)
         steer = math.atan2(
             2.0 * self.geometry.wheelbase * math.sin(alpha), max(goal_distance, 0.1)
@@ -427,11 +429,9 @@ class HybridAStarPlanner:
             obstacles,
             travel_distance=goal_distance,
         )
-        if candidate is None:
-            return None
-        if not self._goal_reached(candidate, goal_xy):
-            return None
-        return candidate
+        if candidate is not None and self._goal_reached(candidate, goal_xy):
+            return candidate
+        return None
 
     def _build_path(
         self,
@@ -485,9 +485,9 @@ class HybridAStarPlanner:
         keep_mask = np.ones(len(x), dtype=bool)
         for idx in range(1, len(x)):
             if (
-                abs(float(x[idx] - x[idx - 1])) < 1e-4
-                and abs(float(y[idx] - y[idx - 1])) < 1e-4
-                and abs(float(wrap_to_pi(float(yaw[idx] - yaw[idx - 1])))) < 1e-4
+                abs(x[idx] - x[idx - 1]) < 1e-4
+                and abs(y[idx] - y[idx - 1]) < 1e-4
+                and abs(wrap_to_pi(yaw[idx] - yaw[idx - 1])) < 1e-4
             ):
                 keep_mask[idx] = False
         return x[keep_mask], y[keep_mask], yaw[keep_mask], directions[keep_mask]
@@ -807,15 +807,11 @@ class TeacherPlanner:
         return (throttle, steering)
 
     def _needs_replan(self, state: VehicleState, goal_xy: np.ndarray) -> bool:
-        if self.path is None or self.goal_xy is None:
-            return True
-        if float(np.linalg.norm(goal_xy - self.goal_xy)) > 1e-3:
-            return True
-        if (
-            self.path.distance_to_point(state.x, state.y)
+        return (
+            self.path is None
+            or self.goal_xy is None
+            or float(np.linalg.norm(goal_xy - self.goal_xy)) > 1e-3
+            or self.path.distance_to_point(state.x, state.y)
             > self.planner_config.replan_distance
-        ):
-            return True
-        if self.controller.at_end(self.path):
-            return True
-        return False
+            or self.controller.at_end(self.path)
+        )

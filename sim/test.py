@@ -23,8 +23,8 @@ def normalize_action(throttle: float, steering: float) -> dict[str, float]:
     else:
         normalized_throttle = throttle / DRIVE_LIMITS.max_reverse_wheel_speed
     return {
-        "throttle": float(max(-1.0, min(1.0, normalized_throttle))),
-        "steering": float(max(-1.0, min(1.0, steering / MAX_STEERING_ANGLE))),
+        "throttle": max(-1.0, min(1.0, normalized_throttle)),
+        "steering": max(-1.0, min(1.0, steering / MAX_STEERING_ANGLE)),
     }
 
 

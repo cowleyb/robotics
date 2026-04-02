@@ -70,6 +70,26 @@ class World:
             for center1, extent1, center2, extent2 in zip(pos1, size1, pos2, size2)
         )
 
+    def _sample_spawn_position(
+        self,
+        size: tuple[float, float, float],
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        z: float,
+    ) -> tuple[float, float, float]:
+        while True:
+            position = (
+                self.rng.uniform(*x_range),
+                self.rng.uniform(*y_range),
+                z,
+            )
+            overlap = any(
+                self._check_overlap(position, size, existing_pos, existing_size)
+                for existing_pos, existing_size in self.spawned_objects
+            )
+            if not overlap:
+                return position
+
     def _build_world(self, seed: int) -> None:
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
@@ -159,18 +179,12 @@ class World:
         self.spawned_objects.append((self.car_pos, self.spawn_car_size))
 
         self.goal_size = GOAL_SIZE
-        while True:
-            self.goal_pos = (
-                self.rng.uniform(0.0, SPAWN_RANGE),
-                self.rng.uniform(0.0, SPAWN_RANGE),
-                GOAL_HEIGHT,
-            )
-            overlap = any(
-                self._check_overlap(self.goal_pos, self.goal_size, p, s)
-                for p, s in self.spawned_objects
-            )
-            if not overlap:
-                break
+        self.goal_pos = self._sample_spawn_position(
+            size=self.goal_size,
+            x_range=(0.0, SPAWN_RANGE),
+            y_range=(0.0, SPAWN_RANGE),
+            z=GOAL_HEIGHT,
+        )
 
         self.goal_zone = self.scene.add_entity(
             gs.morphs.Box(
@@ -188,18 +202,12 @@ class World:
         self.obstacle_size = OBSTACLE_SIZE
         self.obstacle_positions = []
         for i in range(self.obstacle_count):
-            while True:
-                obs_pos = (
-                    self.rng.uniform(-SPAWN_RANGE, SPAWN_RANGE),
-                    self.rng.uniform(-SPAWN_RANGE, SPAWN_RANGE),
-                    OBSTACLE_HEIGHT,
-                )
-                overlap = any(
-                    self._check_overlap(obs_pos, self.obstacle_size, p, s)
-                    for p, s in self.spawned_objects
-                )
-                if not overlap:
-                    break
+            obs_pos = self._sample_spawn_position(
+                size=self.obstacle_size,
+                x_range=(-SPAWN_RANGE, SPAWN_RANGE),
+                y_range=(-SPAWN_RANGE, SPAWN_RANGE),
+                z=OBSTACLE_HEIGHT,
+            )
 
             obstacle = self.scene.add_entity(
                 gs.morphs.Box(
