@@ -1,25 +1,19 @@
-# WIP 
-
+# WIP
 
 ## Getting started
 
-- Install conda, or use venv instead. 
-- Start a virtual environment, taichi supports up to python 3.10
+Use the robot conda environment or create a virtual environment with venv
 ```
-conda create -n robotenv python=3.10 -y
+conda create -n robot python=3.13 -y
 ```
-- activate the environment
-```
-conda activate robotenv
-```
-- install python packages
-```
+
+Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
-- run simulator
-```
-python sim/test.py
-```
 
-
-[ ] add seeding
+Run the simulator:
+```bash
+conda activate robot
+python -m sim.test
+```

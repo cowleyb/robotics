@@ -33,12 +33,7 @@ def _parse_xyz(value: str) -> np.ndarray:
 
 
 def _load_urdf_root(urdf_path: Path) -> ET.Element:
-    text = urdf_path.read_text(encoding="utf-8")
-    end_tag = "</robot>"
-    end = text.find(end_tag)
-    if end != -1:
-        text = text[: end + len(end_tag)]
-    return ET.fromstring(text)
+    return ET.fromstring(urdf_path.read_text(encoding="utf-8"))
 
 
 def _find_joint(root: ET.Element, name: str) -> ET.Element:

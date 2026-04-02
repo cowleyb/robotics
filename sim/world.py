@@ -18,9 +18,18 @@ from sim.path_planning import (
 CAR_URDF_PATH = Path(__file__).resolve().parents[1] / "assets" / "simplecar.urdf"
 DRIVE_LIMITS = DEFAULT_DRIVE_LIMITS
 
-# backward compatible aliases for older callers
-DEFAULT_FORWARD_THROTTLE = DRIVE_LIMITS.max_forward_wheel_speed
-DEFAULT_REVERSE_THROTTLE = -DRIVE_LIMITS.max_reverse_wheel_speed
+SPAWN_RANGE = 3.0
+WORLD_MARGIN = 0.25
+CAR_SPAWN_HEIGHT_OFFSET = 0.02
+CAMERA_OFFSET = (-0.6, 0.0, 0.45)
+CAMERA_LOOKAHEAD = (1.0, 0.0, 0.15)
+GOAL_SIZE = (0.5, 0.5, 0.1)
+GOAL_HEIGHT = 0.05
+OBSTACLE_SIZE = (0.4, 0.4, 0.5)
+OBSTACLE_HEIGHT = 0.25
+GOAL_REACHED_DISTANCE = 0.3
+STEERING_EPSILON = 1e-4
+THROTTLE_EPSILON = 1e-4
 
 
 _CAR_GEOM = load_simplecar_geometry(CAR_URDF_PATH)
@@ -34,43 +43,43 @@ REAR_TRACK = _CAR_GEOM.rear_track
 class World:
     """simple test world for genesis"""
 
-    _gs_initialized = False
-
     def __init__(
         self,
         seed: int = 1,
+        instruction: str = "drive to the goal without hitting obstacles",
         show_viewer: bool = True,
-        enable_camera: bool = False,
         obstacle_count: int = 10,
         backend=gs.gpu,
     ) -> None:
+        self.instruction = instruction
         self.show_viewer = show_viewer
-        self.enable_camera = enable_camera
         self.obstacle_count = obstacle_count
         self.backend = backend
         self._build_world(seed)
 
     @staticmethod
-    def _check_overlap(pos1, size1, pos2, size2):
-        ## AABB check overlapping
-        min1 = [pos1[i] - size1[i] / 2 for i in range(3)]
-        max1 = [pos1[i] + size1[i] / 2 for i in range(3)]
-
-        min2 = [pos2[i] - size2[i] / 2 for i in range(3)]
-        max2 = [pos2[i] + size2[i] / 2 for i in range(3)]
-
-        overlap_x = min1[0] < max2[0] and max1[0] > min2[0]
-        overlap_y = min1[1] < max2[1] and max1[1] > min2[1]
-        overlap_z = min1[2] < max2[2] and max1[2] > min2[2]
-
-        return overlap_x and overlap_y and overlap_z
+    def _check_overlap(
+        pos1: tuple[float, float, float],
+        size1: tuple[float, float, float],
+        pos2: tuple[float, float, float],
+        size2: tuple[float, float, float],
+    ) -> bool:
+        return all(
+            abs(float(center1) - float(center2))
+            < 0.5 * (float(extent1) + float(extent2))
+            for center1, extent1, center2, extent2 in zip(pos1, size1, pos2, size2)
+        )
 
     def _build_world(self, seed: int) -> None:
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
-        if not World._gs_initialized:
+        if gs.backend is None:
             gs.init(backend=self.backend)
-            World._gs_initialized = True
+        elif self.backend != gs.gpu and gs.backend != self.backend:
+            raise RuntimeError(
+                f"Genesis already initialized with backend {gs.backend}, "
+                f"cannot create World with backend {self.backend}."
+            )
 
         self.scene = gs.Scene(
             show_viewer=self.show_viewer,
@@ -90,7 +99,9 @@ class World:
         self.spawned_objects = []
         self.car_size = _CAR_GEOM.base_size
         self.spawn_car_size = (
-            max(float(self.car_size[0]), float(WHEELBASE + 2.0 * _CAR_GEOM.wheel_radius)),
+            max(
+                float(self.car_size[0]), float(WHEELBASE + 2.0 * _CAR_GEOM.wheel_radius)
+            ),
             max(
                 float(self.car_size[1]),
                 float(max(FRONT_TRACK, REAR_TRACK) + _CAR_GEOM.wheel_width),
@@ -98,9 +109,9 @@ class World:
             float(self.car_size[2]),
         )
         self.car_pos = (
-            self.rng.uniform(-3.0, 0.0),
-            self.rng.uniform(-3.0, 0.0),
-            _CAR_GEOM.wheel_radius + 0.02,
+            self.rng.uniform(-SPAWN_RANGE, 0.0),
+            self.rng.uniform(-SPAWN_RANGE, 0.0),
+            _CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
         )
 
         self.car = self.scene.add_entity(
@@ -124,30 +135,35 @@ class World:
             self.car.get_joint("base_to_right_back_wheel").dofs_idx_local[0],
         ]
         self.drive_dofs = self.front_drive_dofs + self.rear_drive_dofs
-        self.fixed_body_height = 0.16
         self.kinematic_xy = np.array(self.car_pos[:2], dtype=np.float32)
         self.kinematic_yaw = 0.0
         self.kinematic_speed = 0.0
         self.commanded_throttle = 0.0
         self.commanded_steering = 0.0
-        self.reverse_steps_remaining = 0
-        self.camera = None
-        if self.enable_camera:
-            self.camera = self.scene.add_camera(
-                res=(128, 128),
-                pos=(self.car_pos[0] - 0.6, self.car_pos[1], 0.45),
-                lookat=(self.car_pos[0] + 1.0, self.car_pos[1], 0.15),
-                fov=90,
-                GUI=False,
-            )
+        self.last_action = np.zeros(2, dtype=np.float32)
+        self.camera = self.scene.add_camera(
+            res=(128, 128),
+            pos=(
+                self.car_pos[0] + CAMERA_OFFSET[0],
+                self.car_pos[1] + CAMERA_OFFSET[1],
+                CAMERA_OFFSET[2],
+            ),
+            lookat=(
+                self.car_pos[0] + CAMERA_LOOKAHEAD[0],
+                self.car_pos[1] + CAMERA_LOOKAHEAD[1],
+                CAMERA_LOOKAHEAD[2],
+            ),
+            fov=90,
+            GUI=False,
+        )
         self.spawned_objects.append((self.car_pos, self.spawn_car_size))
 
-        self.goal_size = (0.5, 0.5, 0.1)
+        self.goal_size = GOAL_SIZE
         while True:
             self.goal_pos = (
-                self.rng.uniform(3.0, 0.0),
-                self.rng.uniform(3.0, 0.0),
-                0.05,
+                self.rng.uniform(0.0, SPAWN_RANGE),
+                self.rng.uniform(0.0, SPAWN_RANGE),
+                GOAL_HEIGHT,
             )
             overlap = any(
                 self._check_overlap(self.goal_pos, self.goal_size, p, s)
@@ -169,14 +185,14 @@ class World:
         self.spawned_objects.append((self.goal_pos, self.goal_size))
 
         self.obstacles = []
-        self.obstacle_size = (0.4, 0.4, 0.5)
+        self.obstacle_size = OBSTACLE_SIZE
         self.obstacle_positions = []
         for i in range(self.obstacle_count):
             while True:
                 obs_pos = (
-                    self.rng.uniform(-3.0, 3.0),
-                    self.rng.uniform(-3.0, 3.0),
-                    0.25,
+                    self.rng.uniform(-SPAWN_RANGE, SPAWN_RANGE),
+                    self.rng.uniform(-SPAWN_RANGE, SPAWN_RANGE),
+                    OBSTACLE_HEIGHT,
                 )
                 overlap = any(
                     self._check_overlap(obs_pos, self.obstacle_size, p, s)
@@ -216,10 +232,10 @@ class World:
                 wheel_radius=float(_CAR_GEOM.wheel_radius),
             ),
             bounds=EnvironmentBounds(
-                min_x=-3.25,
-                max_x=3.25,
-                min_y=-3.25,
-                max_y=3.25,
+                min_x=-(SPAWN_RANGE + WORLD_MARGIN),
+                max_x=SPAWN_RANGE + WORLD_MARGIN,
+                min_y=-(SPAWN_RANGE + WORLD_MARGIN),
+                max_y=SPAWN_RANGE + WORLD_MARGIN,
             ),
             planner_config=PlannerConfig(obstacle_margin=0.10),
             controller_config=PurePursuitConfig(
@@ -253,11 +269,11 @@ class World:
             "goal_size": np.asarray(self.goal_size, dtype=np.float32),
             "obstacle_positions": np.asarray(self.obstacle_positions, dtype=np.float32),
             "obstacle_size": np.asarray(self.obstacle_size, dtype=np.float32),
-        }
-        if self.camera is not None:
-            observation["image"] = self.camera.render(
+            "last_action": self.last_action.copy(),
+            "image": self.camera.render(
                 rgb=True, depth=False, segmentation=False, normal=False
-            )[0]
+            )[0],
+        }
         return observation
 
     def move_car(self, throttle: float, steering: float) -> None:
@@ -269,50 +285,52 @@ class World:
         )
         drive_velocity = np.full(4, self.commanded_throttle, dtype=np.float32)
 
-        if abs(self.commanded_steering) > 1e-4 and abs(self.commanded_throttle) > 1e-4:
+        if (
+            abs(self.commanded_steering) > STEERING_EPSILON
+            and abs(self.commanded_throttle) > THROTTLE_EPSILON
+        ):
             steering_sign = float(np.sign(self.commanded_steering))
             turn_radius = WHEELBASE / np.tan(abs(self.commanded_steering))
+            front_inner_radius = turn_radius - FRONT_TRACK / 2.0
+            rear_inner_radius = turn_radius - REAR_TRACK / 2.0
+            if front_inner_radius > 0.0 and rear_inner_radius > 0.0:
+                inner_steer = np.arctan(WHEELBASE / front_inner_radius)
+                outer_steer = np.arctan(WHEELBASE / (turn_radius + FRONT_TRACK / 2.0))
 
-            inner_steer = np.arctan(
-                WHEELBASE / max(turn_radius - FRONT_TRACK / 2.0, 1e-3)
-            )
-            outer_steer = np.arctan(WHEELBASE / (turn_radius + FRONT_TRACK / 2.0))
+                rear_outer_radius = turn_radius + REAR_TRACK / 2.0
+                front_inner_wheel_radius = np.hypot(WHEELBASE, rear_inner_radius)
+                front_outer_wheel_radius = np.hypot(WHEELBASE, rear_outer_radius)
 
-            rear_inner_radius = max(turn_radius - REAR_TRACK / 2.0, 1e-3)
-            rear_outer_radius = turn_radius + REAR_TRACK / 2.0
-            front_inner_radius = np.hypot(WHEELBASE, rear_inner_radius)
-            front_outer_radius = np.hypot(WHEELBASE, rear_outer_radius)
+                if steering_sign > 0.0:
+                    steering_targets = np.array(
+                        [inner_steer, outer_steer], dtype=np.float32
+                    )
+                    wheel_radius_scale = np.array(
+                        [
+                            front_inner_wheel_radius,
+                            front_outer_wheel_radius,
+                            rear_inner_radius,
+                            rear_outer_radius,
+                        ],
+                        dtype=np.float32,
+                    )
+                else:
+                    steering_targets = np.array(
+                        [-outer_steer, -inner_steer], dtype=np.float32
+                    )
+                    wheel_radius_scale = np.array(
+                        [
+                            front_outer_wheel_radius,
+                            front_inner_wheel_radius,
+                            rear_outer_radius,
+                            rear_inner_radius,
+                        ],
+                        dtype=np.float32,
+                    )
 
-            if steering_sign > 0.0:
-                steering_targets = np.array(
-                    [inner_steer, outer_steer], dtype=np.float32
-                )
-                wheel_radius_scale = np.array(
-                    [
-                        front_inner_radius,
-                        front_outer_radius,
-                        rear_inner_radius,
-                        rear_outer_radius,
-                    ],
-                    dtype=np.float32,
-                )
-            else:
-                steering_targets = np.array(
-                    [-outer_steer, -inner_steer], dtype=np.float32
-                )
-                wheel_radius_scale = np.array(
-                    [
-                        front_outer_radius,
-                        front_inner_radius,
-                        rear_outer_radius,
-                        rear_inner_radius,
-                    ],
-                    dtype=np.float32,
-                )
-
-            drive_velocity = (
-                self.commanded_throttle * wheel_radius_scale / turn_radius
-            ).astype(np.float32)
+                drive_velocity = (
+                    self.commanded_throttle * wheel_radius_scale / turn_radius
+                ).astype(np.float32)
 
         self.car.control_dofs_position(
             position=steering_targets,
@@ -326,16 +344,12 @@ class World:
     def goal_reached(self) -> bool:
         car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
         goal_position = np.asarray(self.goal_pos, dtype=np.float32)
-        return np.linalg.norm(car_position[:2] - goal_position[:2]) < 0.3
+        return np.linalg.norm(car_position[:2] - goal_position[:2]) < GOAL_REACHED_DISTANCE
 
     def hit_obstacle(self) -> bool:
         for obstacle in self.obstacles:
             contact_info = self.car.get_contacts(with_entity=obstacle)
-            geom_a = contact_info["geom_a"]
-            contact_count = (
-                int(geom_a.numel()) if hasattr(geom_a, "numel") else int(geom_a.size)
-            )
-            if contact_count > 0:
+            if int(contact_info["geom_a"].numel()) > 0:
                 return True
         return False
 

@@ -81,7 +81,7 @@ class PlannerConfig:
     smoothing_factor: float = 0.02  # how much this rounds off the final route
     smoothing_resolution: float = 0.05  # spacing for the rounded off route
     replan_distance: float = (
-        0.55  # if the car drifts this far from the route, plan again
+        0.15  # if the car drifts this far from the route, plan again
     )
 
 
@@ -791,7 +791,10 @@ class TeacherPlanner:
             self.controller.reset()
 
         if self.path is None:
-            return (0.0, 0.0)
+            raise RuntimeError(
+                f"could not find a path from ({state.x:.2f}, {state.y:.2f}) "
+                f"to ({float(goal_xy[0]):.2f}, {float(goal_xy[1]):.2f})."
+            )
 
         # check if close enough to goal stop dirving
         if (
