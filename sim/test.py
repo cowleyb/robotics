@@ -59,11 +59,6 @@ def save_episode(
             force_cache_sync=False,
             download_videos=False,
         )
-        if "observation.images.front" not in dataset.features:
-            raise ValueError(
-                f"Existing dataset at {LEROBOT_ROOT} was created without camera images. "
-                "Remove it before recording with mandatory images."
-            )
     else:
         dataset = LeRobotDataset.create(
             repo_id=LEROBOT_REPO_ID,
@@ -182,15 +177,28 @@ def main() -> None:
         action="store_true",
     )
     parser.add_argument(
+        "--show_viewer",
+        action="store_true",
+    )
+    parser.add_argument(
         "--instruction",
         default="drive to the goal without hitting obstacles",
     )
+    parser.add_argument(
+        "--seed",
+        default=None,
+    )
     args = parser.parse_args()
 
-    seed = int(secrets.randbelow(2**31 - 1))
+    if args.seed is not None:
+        seed = int(args.seed)
+    else:
+        seed = int(secrets.randbelow(2**31 - 1))
+
     world = World(
         seed=seed,
         instruction=args.instruction,
+        show_viewer=args.show_viewer,
     )
 
     observation = world.get_observation()
