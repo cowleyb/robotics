@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 import secrets
 
 import numpy as np
@@ -283,90 +284,99 @@ def main() -> None:
             show_viewer=args.show_viewer,
             obstacle_count=stage_config.obstacle_count,
         )
+        try:
+            observation = world.get_observation()
+            print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
 
-        observation = world.get_observation()
-        print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
+            step_count = 0
+            trajectory = []
+            control_state = {
+                "forward": 0.0,
+                "reverse": 0.0,
+                "left": 0.0,
+                "right": 0.0,
+            }
 
-        step_count = 0
-        trajectory = []
-        control_state = {
-            "forward": 0.0,
-            "reverse": 0.0,
-            "left": 0.0,
-            "right": 0.0,
-        }
-
-        if args.manual:
-            register_keyboard_controls(world, control_state)
-
-        reached_goal = False
-        hit_obstacle = False
-        timed_out = False
-        planning_error: RuntimeError | None = None
-        while True:
             if args.manual:
-                throttle = (
-                    DRIVE_LIMITS.max_forward_wheel_speed * control_state["forward"]
-                    - DRIVE_LIMITS.max_reverse_wheel_speed * control_state["reverse"]
+                register_keyboard_controls(world, control_state)
+
+            reached_goal = False
+            hit_obstacle = False
+            timed_out = False
+            planning_error: RuntimeError | None = None
+            while True:
+                if args.manual:
+                    throttle = (
+                        DRIVE_LIMITS.max_forward_wheel_speed * control_state["forward"]
+                        - DRIVE_LIMITS.max_reverse_wheel_speed
+                        * control_state["reverse"]
+                    )
+                    steering = MAX_STEERING_ANGLE * (
+                        control_state["left"] - control_state["right"]
+                    )
+                else:
+                    try:
+                        throttle, steering = world.heuristic_action()
+                    except RuntimeError as exc:
+                        planning_error = exc
+                        print(
+                            f"episode {episode_idx + 1}: planner failed at step {step_count} "
+                            f"for seed {world.seed}: {exc}"
+                        )
+                        break
+                normalized_action = normalize_action(
+                    throttle=throttle, steering=steering
                 )
-                steering = MAX_STEERING_ANGLE * (
-                    control_state["left"] - control_state["right"]
+                world.last_action = np.array(
+                    [normalized_action["throttle"], normalized_action["steering"]],
+                    dtype=np.float32,
                 )
-            else:
-                try:
-                    throttle, steering = world.heuristic_action()
-                except RuntimeError as exc:
-                    planning_error = exc
+                world.move_car(throttle=throttle, steering=steering)
+                next_observation = world.step()
+                step_count += 1
+                reached_goal = world.goal_reached()
+                hit_obstacle = world.hit_obstacle()
+                timed_out = step_count >= 5000
+                trajectory.append(
+                    build_lerobot_frame(
+                        observation=observation,
+                        action=normalized_action,
+                        instruction=world.instruction,
+                    )
+                )
+                observation = next_observation
+                if reached_goal:
                     print(
-                        f"episode {episode_idx + 1}: planner failed at step {step_count} "
-                        f"for seed {world.seed}: {exc}"
+                        f"episode {episode_idx + 1}: goal reached at step {step_count}"
                     )
                     break
-            normalized_action = normalize_action(throttle=throttle, steering=steering)
-            world.last_action = np.array(
-                [normalized_action["throttle"], normalized_action["steering"]],
-                dtype=np.float32,
-            )
-            world.move_car(throttle=throttle, steering=steering)
-            next_observation = world.step()
-            step_count += 1
-            reached_goal = world.goal_reached()
-            hit_obstacle = world.hit_obstacle()
-            timed_out = step_count >= 5000
-            trajectory.append(
-                build_lerobot_frame(
-                    observation=observation,
-                    action=normalized_action,
-                    instruction=world.instruction,
-                )
-            )
-            observation = next_observation
-            if reached_goal:
-                print(f"episode {episode_idx + 1}: goal reached at step {step_count}")
-                break
-            if hit_obstacle:
-                print(f"episode {episode_idx + 1}: hit obstacle at step {step_count}")
-                break
-            if timed_out:
-                print(f"episode {episode_idx + 1}: timeout at step {step_count}")
-                break
+                if hit_obstacle:
+                    print(
+                        f"episode {episode_idx + 1}: hit obstacle at step {step_count}"
+                    )
+                    break
+                if timed_out:
+                    print(f"episode {episode_idx + 1}: timeout at step {step_count}")
+                    break
 
-        print(f"episode {episode_idx + 1}: collected {len(trajectory)} samples")
-        if planning_error is not None:
-            failed_seeds.append(world.seed)
-            print(f"episode {episode_idx + 1}: skipped saving planner failure")
-            continue
-        if not reached_goal:
-            failed_seeds.append(world.seed)
-            print(f"episode {episode_idx + 1}: skipped saving unsuccessful rollout")
-            continue
+            print(f"episode {episode_idx + 1}: collected {len(trajectory)} samples")
+            if planning_error is not None:
+                failed_seeds.append(world.seed)
+                print(f"episode {episode_idx + 1}: skipped saving planner failure")
+                continue
+            if not reached_goal:
+                failed_seeds.append(world.seed)
+                print(f"episode {episode_idx + 1}: skipped saving unsuccessful rollout")
+                continue
 
-        output_path = save_episode(
-            trajectory=trajectory,
-            stage_config=stage_config,
-        )
-        saved_episodes += 1
-        print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
+            output_path = save_episode(
+                trajectory=trajectory,
+                stage_config=stage_config,
+            )
+            saved_episodes += 1
+            print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
+        finally:
+            world.close()
 
     print(f"saved {saved_episodes}/{args.episodes} successful episodes")
     if failed_seeds:

@@ -189,7 +189,10 @@ class World:
         self.obstacle_positions = list(obstacle_positions)
         self.teacher_obstacles = list(teacher_obstacles)
         self.teacher_planner = teacher_planner
-        self.spawned_objects = [(self.car_pos, self.spawn_car_size), (self.goal_pos, self.goal_size)]
+        self.spawned_objects = [
+            (self.car_pos, self.spawn_car_size),
+            (self.goal_pos, self.goal_size),
+        ]
 
         self.scene = gs.Scene(
             show_viewer=self.show_viewer,
@@ -460,7 +463,9 @@ class World:
     def goal_reached(self) -> bool:
         car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
         goal_position = np.asarray(self.goal_pos, dtype=np.float32)
-        return np.linalg.norm(car_position[:2] - goal_position[:2]) < GOAL_REACHED_DISTANCE
+        return (
+            np.linalg.norm(car_position[:2] - goal_position[:2]) < GOAL_REACHED_DISTANCE
+        )
 
     def hit_obstacle(self) -> bool:
         for obstacle in self.obstacles:
@@ -497,6 +502,11 @@ class World:
     def step(self) -> dict[str, np.ndarray]:
         self.scene.step()
         return self.get_observation()
+
+    def close(self) -> None:
+        if getattr(self, "scene", None) is not None:
+            self.scene.destroy()
+            self.scene = None
 
     def reset(self, seed: int | None = None) -> dict[str, np.ndarray]:
         next_seed = self.seed if seed is None else seed

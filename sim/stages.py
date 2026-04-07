@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LEROBOT_DATA_ROOT = PROJECT_ROOT / "data" / "lerobot"
+LEROBOT_DATA_ROOT = PROJECT_ROOT / "data"
 TRAIN_OUTPUTS_ROOT = PROJECT_ROOT / "outputs" / "train"
 
 
@@ -20,7 +20,7 @@ class StageConfig:
 
     @property
     def dataset_name(self) -> str:
-        return f"robotics-sim-stage-{self.number}-{self.name}"
+        return f"stage-{self.number}-{self.name}"
 
     @property
     def repo_id(self) -> str:
@@ -62,11 +62,15 @@ def get_stage_config(stage: int) -> StageConfig:
         return STAGE_CONFIGS[stage]
     except KeyError as exc:
         available = ", ".join(str(number) for number in sorted(STAGE_CONFIGS))
-        raise ValueError(f"Unknown stage {stage}. Available stages: {available}.") from exc
+        raise ValueError(
+            f"Unknown stage {stage}. Available stages: {available}."
+        ) from exc
 
 
 def find_latest_checkpoint(stage_config: StageConfig) -> Path:
-    checkpoints = list(stage_config.train_output_root.glob("*/*/checkpoints/*/pretrained_model"))
+    checkpoints = list(
+        stage_config.train_output_root.glob("*/*/checkpoints/*/pretrained_model")
+    )
     if not checkpoints:
         raise FileNotFoundError(
             f"No trained checkpoint found under {stage_config.train_output_root}"
