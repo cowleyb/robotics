@@ -2,6 +2,7 @@ from pathlib import Path
 import genesis as gs
 import numpy as np
 import random
+from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from sim.car_geometry import load_simplecar_geometry
 from sim.control_limits import DEFAULT_DRIVE_LIMITS
@@ -28,6 +29,9 @@ OBSTACLE_HEIGHT = 0.25
 GOAL_REACHED_DISTANCE = 0.3
 STEERING_EPSILON = 1e-4
 THROTTLE_EPSILON = 1e-4
+DEFAULT_VIEWER_POS = (0.0, 0.0, 10.0)
+DEFAULT_VIEWER_LOOKAT = (0.0, 0.0, 0.0)
+DEFAULT_VIEWER_UP = (0.0, 1.0, 0.0)
 
 
 _CAR_GEOM = load_simplecar_geometry(CAR_URDF_PATH)
@@ -55,6 +59,7 @@ class World:
         self.show_viewer = show_viewer
         self.obstacle_count = obstacle_count
         self.backend = backend
+        self.robot_view_enabled = False
         self._build_world(seed)
 
     @staticmethod
@@ -190,8 +195,8 @@ class World:
             show_viewer=self.show_viewer,
             sim_options=gs.options.SimOptions(dt=0.01, gravity=(0, 0, -9.81)),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(0.0, 0.0, 10.0),
-                camera_lookat=(0.0, 0.0, 0.0),
+                camera_pos=DEFAULT_VIEWER_POS,
+                camera_lookat=DEFAULT_VIEWER_LOOKAT,
                 camera_fov=60,
             ),
             # vis_options=gs.options.VisOptions(
@@ -270,6 +275,17 @@ class World:
             self.obstacles.append(obstacle)
 
         self.scene.build()
+        if self.show_viewer:
+            self.scene.viewer.register_keybinds(
+                Keybind(
+                    "toggle_robot_view",
+                    Key.C,
+                    KeyAction.PRESS,
+                    callback=self.toggle_viewer_mode,
+                ),
+                overwrite=True,
+            )
+            self._apply_viewer_camera_pose()
 
     def _build_world(self, seed: int) -> None:
         self.seed = int(seed)
@@ -308,7 +324,51 @@ class World:
         w, x, y, z = quat
         return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
+    def _camera_pose_from_car(self) -> tuple[np.ndarray, np.ndarray]:
+        car_position = np.asarray(self.car.get_pos(), dtype=np.float32)
+        car_quat = np.asarray(self.car.get_quat(), dtype=np.float32)
+        car_yaw = self._yaw_from_quat(car_quat)
+        cos_yaw = np.cos(car_yaw)
+        sin_yaw = np.sin(car_yaw)
+
+        def rotate_xy(local_xy: tuple[float, float]) -> np.ndarray:
+            return np.asarray(
+                [
+                    cos_yaw * local_xy[0] - sin_yaw * local_xy[1],
+                    sin_yaw * local_xy[0] + cos_yaw * local_xy[1],
+                ],
+                dtype=np.float32,
+            )
+
+        camera_pos = car_position.copy()
+        camera_pos[:2] += rotate_xy(CAMERA_OFFSET[:2])
+        camera_pos[2] += CAMERA_OFFSET[2]
+
+        camera_lookat = car_position.copy()
+        camera_lookat[:2] += rotate_xy(CAMERA_LOOKAHEAD[:2])
+        camera_lookat[2] += CAMERA_LOOKAHEAD[2]
+        return camera_pos, camera_lookat
+
+    def _apply_viewer_camera_pose(self) -> None:
+        if not self.show_viewer:
+            return
+        if self.robot_view_enabled:
+            camera_pos, camera_lookat = self._camera_pose_from_car()
+            self.scene.viewer.set_camera_pose(pos=camera_pos, lookat=camera_lookat)
+            return
+        self.scene.viewer.set_camera_pose(
+            pos=np.asarray(DEFAULT_VIEWER_POS, dtype=np.float32),
+            lookat=np.asarray(DEFAULT_VIEWER_LOOKAT, dtype=np.float32),
+        )
+
+    def toggle_viewer_mode(self) -> None:
+        self.robot_view_enabled = not self.robot_view_enabled
+        self._apply_viewer_camera_pose()
+
     def get_observation(self) -> dict[str, np.ndarray]:
+        camera_pos, camera_lookat = self._camera_pose_from_car()
+        self.camera.set_pose(pos=camera_pos, lookat=camera_lookat, up=DEFAULT_VIEWER_UP)
+        self._apply_viewer_camera_pose()
         observation = {
             "car_position": np.asarray(self.car.get_pos(), dtype=np.float32),
             "car_quaternion": np.asarray(self.car.get_quat(), dtype=np.float32),
