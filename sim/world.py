@@ -62,6 +62,10 @@ class World:
         self.robot_view_enabled = False
         self._build_world(seed)
 
+    def _set_seed(self, seed: int) -> None:
+        self.seed = int(seed)
+        self.rng = random.Random(self.seed)
+
     @staticmethod
     def _check_overlap(
         pos1: tuple[float, float, float],
@@ -291,8 +295,7 @@ class World:
             self._apply_viewer_camera_pose()
 
     def _build_world(self, seed: int) -> None:
-        self.seed = int(seed)
-        self.rng = random.Random(self.seed)
+        self._set_seed(seed)
         if gs.backend is None:
             gs.init(backend=self.backend)
         elif self.backend != gs.gpu and gs.backend != self.backend:
@@ -510,5 +513,37 @@ class World:
 
     def reset(self, seed: int | None = None) -> dict[str, np.ndarray]:
         next_seed = self.seed if seed is None else seed
-        self._build_world(next_seed)
+        self._set_seed(next_seed)
+        car_pos, goal_pos, obstacle_positions, teacher_obstacles = self._sample_layout()
+
+        self.scene.reset()
+        self.car_pos = car_pos
+        self.goal_pos = goal_pos
+        self.obstacle_positions = list(obstacle_positions)
+        self.teacher_obstacles = list(teacher_obstacles)
+        self.spawned_objects = [(self.car_pos, self.spawn_car_size), (self.goal_pos, self.goal_size)]
+
+        self.car.set_pos(np.asarray(self.car_pos, dtype=np.float32), zero_velocity=True)
+        self.car.set_quat(np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32), zero_velocity=True)
+        self.car.set_dofs_position(
+            np.zeros(len(self.steering_dofs), dtype=np.float32),
+            dofs_idx_local=self.steering_dofs,
+            zero_velocity=True,
+        )
+        self.car.set_dofs_velocity(
+            np.zeros(len(self.drive_dofs), dtype=np.float32),
+            dofs_idx_local=self.drive_dofs,
+        )
+
+        self.goal_zone.set_pos(np.asarray(self.goal_pos, dtype=np.float32))
+        for obstacle, obstacle_pos in zip(self.obstacles, self.obstacle_positions):
+            obstacle.set_pos(np.asarray(obstacle_pos, dtype=np.float32))
+            self.spawned_objects.append((obstacle_pos, self.obstacle_size))
+
+        self.kinematic_xy = np.array(self.car_pos[:2], dtype=np.float32)
+        self.kinematic_yaw = 0.0
+        self.kinematic_speed = 0.0
+        self.commanded_throttle = 0.0
+        self.commanded_steering = 0.0
+        self.last_action = np.zeros(2, dtype=np.float32)
         return self.get_observation()

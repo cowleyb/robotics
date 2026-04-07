@@ -272,20 +272,26 @@ def main() -> None:
     saved_episodes = 0
     failed_seeds = []
     print(f"{stage_config.label} dataset: {stage_config.dataset_root}")
-    for episode_idx in range(args.episodes):
-        if base_seed is not None:
-            seed = base_seed + episode_idx
-        else:
-            seed = int(secrets.randbelow(2**31 - 1))
+    initial_seed = base_seed if base_seed is not None else int(secrets.randbelow(2**31 - 1))
+    world = World(
+        seed=initial_seed,
+        instruction=instruction,
+        show_viewer=args.show_viewer,
+        obstacle_count=stage_config.obstacle_count,
+    )
+    try:
+        for episode_idx in range(args.episodes):
+            if base_seed is not None:
+                seed = base_seed + episode_idx
+            elif episode_idx == 0:
+                seed = initial_seed
+            else:
+                seed = int(secrets.randbelow(2**31 - 1))
 
-        world = World(
-            seed=seed,
-            instruction=instruction,
-            show_viewer=args.show_viewer,
-            obstacle_count=stage_config.obstacle_count,
-        )
-        try:
-            observation = world.get_observation()
+            if episode_idx == 0:
+                observation = world.get_observation()
+            else:
+                observation = world.reset(seed=seed)
             print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
 
             step_count = 0
@@ -375,8 +381,8 @@ def main() -> None:
             )
             saved_episodes += 1
             print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
-        finally:
-            world.close()
+    finally:
+        world.close()
 
     print(f"saved {saved_episodes}/{args.episodes} successful episodes")
     if failed_seeds:
