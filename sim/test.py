@@ -1,15 +1,11 @@
 import argparse
-from pathlib import Path
 import secrets
 
 import numpy as np
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LEROBOT_REPO_ID = "local/robotics-sim-car"
-LEROBOT_ROOT = PROJECT_ROOT / "data" / "lerobot" / "robotics-sim-car"
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 from genesis.vis.keybindings import Key, KeyAction, Keybind
+from sim.stages import StageConfig, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
 
@@ -46,6 +42,7 @@ def rotate_world_vector_to_car_frame(
 
 def save_episode(
     trajectory: list[dict[str, object]],
+    stage_config: StageConfig,
 ) -> Path:
     if not trajectory:
         raise ValueError("trajectory must contain at least one frame")
@@ -68,21 +65,10 @@ def save_episode(
         },
     }
 
-    if LEROBOT_ROOT.exists():
-        dataset = LeRobotDataset(
-            repo_id=LEROBOT_REPO_ID,
-            root=LEROBOT_ROOT,
-            force_cache_sync=False,
-            download_videos=False,
-        )
-    else:
-        dataset = LeRobotDataset.create(
-            repo_id=LEROBOT_REPO_ID,
-            fps=100,
-            features=features,
-            root=LEROBOT_ROOT,
-            use_videos=False,
-        )
+    dataset = open_lerobot_dataset(
+        features=features,
+        stage_config=stage_config,
+    )
 
     for frame in trajectory:
         dataset.add_frame(dict(frame))
@@ -91,11 +77,56 @@ def save_episode(
     return dataset.root
 
 
-def build_lerobot_frame(
+def open_lerobot_dataset(
+    features: dict[str, dict[str, object]],
+    stage_config: StageConfig,
+) -> LeRobotDataset:
+    if not stage_config.dataset_root.exists():
+        return LeRobotDataset.create(
+            repo_id=stage_config.repo_id,
+            fps=100,
+            features=features,
+            root=stage_config.dataset_root,
+            use_videos=False,
+        )
+
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.repo_id = stage_config.repo_id
+    dataset.root = stage_config.dataset_root
+    dataset.revision = None
+    dataset.image_transforms = None
+    dataset.delta_timestamps = None
+    dataset.episodes = None
+    dataset.tolerance_s = 1e-4
+    dataset.video_backend = None
+    dataset.delta_indices = None
+    dataset.batch_encoding_size = 1
+    dataset.episodes_since_last_encoding = 0
+    dataset.vcodec = "libsvtav1"
+    dataset._encoder_threads = None
+    dataset.image_writer = None
+    dataset.episode_buffer = None
+    dataset.writer = None
+    dataset.latest_episode = None
+    dataset._current_file_start_frame = None
+    dataset._streaming_encoder = None
+    dataset.meta = LeRobotDatasetMetadata(
+        repo_id=stage_config.repo_id,
+        root=stage_config.dataset_root,
+        force_cache_sync=False,
+    )
+    dataset._lazy_loading = False
+    dataset._recorded_frames = dataset.meta.total_frames
+    dataset._writer_closed_for_reading = False
+    dataset.hf_dataset = dataset.create_hf_dataset()
+    dataset._absolute_to_relative_idx = None
+    dataset.episode_buffer = dataset.create_episode_buffer()
+    return dataset
+
+
+def build_lerobot_observation(
     observation: dict[str, np.ndarray],
-    action: dict[str, float],
-    instruction: str,
-) -> dict[str, object]:
+) -> dict[str, np.ndarray]:
     goal_delta_world = np.asarray(
         observation["goal_position"][:2] - observation["car_position"][:2],
         dtype=np.float32,
@@ -117,18 +148,28 @@ def build_lerobot_frame(
         ),
         dtype=np.float32,
     )
-    frame = {
-        "task": instruction,
-        "observation.state": observation_state,
-        "action": np.asarray(
-            [action["throttle"], action["steering"]],
-            dtype=np.float32,
-        ),
-        "observation.images.front": np.asarray(
+    return {
+        "observation.state": np.ascontiguousarray(observation_state),
+        "observation.images.front": np.ascontiguousarray(
             observation["image"],
             dtype=np.uint8,
         ),
     }
+
+
+def build_lerobot_frame(
+    observation: dict[str, np.ndarray],
+    action: dict[str, float],
+    instruction: str,
+) -> dict[str, object]:
+    frame = build_lerobot_observation(
+        observation=observation,
+    )
+    frame["task"] = instruction
+    frame["action"] = np.asarray(
+        [action["throttle"], action["steering"]],
+        dtype=np.float32,
+    )
     return frame
 
 
@@ -206,8 +247,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--instruction",
-        default="drive to the goal without hitting obstacles",
+        default=None,
     )
+    parser.add_argument("--stage", type=int, default=1)
     parser.add_argument(
         "--seed",
         default=None,
@@ -222,10 +264,13 @@ def main() -> None:
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
 
+    stage_config = get_stage_config(args.stage)
+    instruction = args.instruction or stage_config.instruction
     base_seed = int(args.seed) if args.seed is not None else None
     output_path = None
     saved_episodes = 0
     failed_seeds = []
+    print(f"{stage_config.label} dataset: {stage_config.dataset_root}")
     for episode_idx in range(args.episodes):
         if base_seed is not None:
             seed = base_seed + episode_idx
@@ -234,8 +279,9 @@ def main() -> None:
 
         world = World(
             seed=seed,
-            instruction=args.instruction,
+            instruction=instruction,
             show_viewer=args.show_viewer,
+            obstacle_count=stage_config.obstacle_count,
         )
 
         observation = world.get_observation()
@@ -317,6 +363,7 @@ def main() -> None:
 
         output_path = save_episode(
             trajectory=trajectory,
+            stage_config=stage_config,
         )
         saved_episodes += 1
         print(f"episode {episode_idx + 1}: saved LeRobot dataset: {output_path}")
