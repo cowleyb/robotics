@@ -28,13 +28,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument(
-        "--instruction",
-        default=None,
-    )
+    parser.add_argument("--instruction", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
+
+    if args.episodes < 1:
+        raise ValueError("--episodes must be at least 1")
 
     stage_config = get_stage_config(args.stage)
     checkpoint = args.checkpoint or find_latest_checkpoint(stage_config)
@@ -51,49 +53,75 @@ def main() -> None:
         },
     )
 
-    seed = args.seed if args.seed is not None else int(secrets.randbelow(2**31 - 1))
+    base_seed = args.seed
+    initial_seed = base_seed if base_seed is not None else int(secrets.randbelow(2**31 - 1))
     world = World(
-        seed=seed,
+        seed=initial_seed,
         instruction=instruction,
-        show_viewer=True,
+        show_viewer=not args.headless,
         obstacle_count=stage_config.obstacle_count,
     )
-    policy.reset()
-    observation = world.get_observation()
+    successes = 0
+    collisions = 0
+    timeouts = 0
+
     print(f"{stage_config.label}")
     print(f"checkpoint: {checkpoint}")
-    print(f"seed: {world.seed}")
+    try:
+        for episode_idx in range(args.episodes):
+            if base_seed is not None:
+                seed = base_seed + episode_idx
+            elif episode_idx == 0:
+                seed = initial_seed
+            else:
+                seed = int(secrets.randbelow(2**31 - 1))
 
-    for step_idx in range(1, args.max_steps + 1):
-        model_observation = build_lerobot_observation(
-            observation=observation,
-        )
-        action = predict_action(
-            observation=model_observation,
-            policy=policy,
-            device=device,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            use_amp=policy.config.use_amp,
-            task=world.instruction,
-        )
-        normalized_action = np.asarray(
-            action.squeeze(0).detach().cpu().numpy(),
-            dtype=np.float32,
-        )
-        world.last_action = normalized_action.copy()
-        throttle, steering = unnormalize_action(normalized_action)
-        world.move_car(throttle=throttle, steering=steering)
-        observation = world.step()
+            policy.reset()
+            if episode_idx == 0:
+                observation = world.get_observation()
+            else:
+                observation = world.reset(seed=seed)
+            print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
 
-        if world.goal_reached():
-            print(f"goal reached at step {step_idx}")
-            return
-        if world.hit_obstacle():
-            print(f"hit obstacle at step {step_idx}")
-            return
+            for step_idx in range(1, args.max_steps + 1):
+                model_observation = build_lerobot_observation(
+                    observation=observation,
+                )
+                action = predict_action(
+                    observation=model_observation,
+                    policy=policy,
+                    device=device,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=world.instruction,
+                )
+                normalized_action = np.asarray(
+                    action.squeeze(0).detach().cpu().numpy(),
+                    dtype=np.float32,
+                )
+                world.last_action = normalized_action.copy()
+                throttle, steering = unnormalize_action(normalized_action)
+                world.move_car(throttle=throttle, steering=steering)
+                observation = world.step()
 
-    print(f"timeout at step {args.max_steps}")
+                if world.goal_reached():
+                    successes += 1
+                    print(f"episode {episode_idx + 1}: goal reached at step {step_idx}")
+                    break
+                if world.hit_obstacle():
+                    collisions += 1
+                    print(f"episode {episode_idx + 1}: hit obstacle at step {step_idx}")
+                    break
+            else:
+                timeouts += 1
+                print(f"episode {episode_idx + 1}: timeout at step {args.max_steps}")
+    finally:
+        world.close()
+
+    print(f"successes: {successes}/{args.episodes}")
+    print(f"collisions: {collisions}")
+    print(f"timeouts: {timeouts}")
 
 
 if __name__ == "__main__":
