@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 import genesis as gs
 import numpy as np
@@ -32,6 +33,22 @@ THROTTLE_EPSILON = 1e-4
 DEFAULT_VIEWER_POS = (0.0, 0.0, 10.0)
 DEFAULT_VIEWER_LOOKAT = (0.0, 0.0, 0.0)
 DEFAULT_VIEWER_UP = (0.0, 1.0, 0.0)
+SIM_DT = 0.01
+
+
+@dataclass(frozen=True)
+class GPSSensorConfig:
+    update_period_s: float = 0.2
+    position_noise_std_m: float = 0.15
+    initial_bias_std_m: float = 0.2
+    bias_walk_std_m: float = 0.01
+    outage_probability_per_update: float = 0.02
+    outage_duration_range_s: tuple[float, float] = (0.5, 1.5)
+    stale_accuracy_growth_m_per_s: float = 0.75
+    max_horizontal_accuracy_m: float = 5.0
+
+
+GPS_SENSOR = GPSSensorConfig()
 
 
 _CAR_GEOM = load_simplecar_geometry(CAR_URDF_PATH)
@@ -44,6 +61,11 @@ REAR_AXLE_OFFSET = abs(_CAR_GEOM.rear_axle_x)
 PLANNER_COLLISION_CENTER_OFFSET = 0.5 * WHEELBASE
 
 
+def _quat_from_yaw(yaw: float) -> tuple[float, float, float, float]:
+    half_yaw = 0.5 * yaw
+    return (float(np.cos(half_yaw)), 0.0, 0.0, float(np.sin(half_yaw)))
+
+
 class World:
     """simple test world for genesis"""
 
@@ -53,18 +75,21 @@ class World:
         instruction: str = "drive to the goal without hitting obstacles",
         show_viewer: bool = True,
         obstacle_count: int = 10,
+        gps_sensor_config: GPSSensorConfig = GPS_SENSOR,
         backend=gs.gpu,
     ) -> None:
         self.instruction = instruction
         self.show_viewer = show_viewer
         self.obstacle_count = obstacle_count
         self.backend = backend
+        self.gps_sensor_config = gps_sensor_config
         self.robot_view_enabled = False
         self._build_world(seed)
 
     def _set_seed(self, seed: int) -> None:
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
+        self.np_rng = np.random.default_rng(self.seed)
 
     @staticmethod
     def _check_overlap(
@@ -129,6 +154,7 @@ class World:
         self,
     ) -> tuple[
         tuple[float, float, float],
+        float,
         tuple[float, float, float],
         list[tuple[float, float, float]],
         list[ObstacleBox],
@@ -141,6 +167,7 @@ class World:
             self.rng.uniform(-SPAWN_RANGE, 0.0),
             _CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
         )
+        car_yaw = self.rng.uniform(-np.pi, np.pi)
         spawned_objects.append((car_pos, self.spawn_car_size))
 
         goal_pos = self._sample_spawn_position(
@@ -175,6 +202,7 @@ class World:
         ]
         return (
             car_pos,
+            float(car_yaw),
             goal_pos,
             obstacle_positions,
             teacher_obstacles,
@@ -183,12 +211,14 @@ class World:
     def _build_scene_from_layout(
         self,
         car_pos: tuple[float, float, float],
+        car_yaw: float,
         goal_pos: tuple[float, float, float],
         obstacle_positions: list[tuple[float, float, float]],
         teacher_obstacles: list[ObstacleBox],
         teacher_planner: TeacherPlanner,
     ) -> None:
         self.car_pos = car_pos
+        self.car_yaw = float(car_yaw)
         self.goal_pos = goal_pos
         self.obstacle_positions = list(obstacle_positions)
         self.teacher_obstacles = list(teacher_obstacles)
@@ -200,7 +230,7 @@ class World:
 
         self.scene = gs.Scene(
             show_viewer=self.show_viewer,
-            sim_options=gs.options.SimOptions(dt=0.01, gravity=(0, 0, -9.81)),
+            sim_options=gs.options.SimOptions(dt=SIM_DT, gravity=(0, 0, -9.81)),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=DEFAULT_VIEWER_POS,
                 camera_lookat=DEFAULT_VIEWER_LOOKAT,
@@ -217,6 +247,7 @@ class World:
             gs.morphs.URDF(
                 file=str(CAR_URDF_PATH),
                 pos=self.car_pos,
+                quat=_quat_from_yaw(self.car_yaw),
                 collision=True,
             ),
             name="car",
@@ -235,7 +266,7 @@ class World:
         ]
         self.drive_dofs = self.front_drive_dofs + self.rear_drive_dofs
         self.kinematic_xy = np.array(self.car_pos[:2], dtype=np.float32)
-        self.kinematic_yaw = 0.0
+        self.kinematic_yaw = float(self.car_yaw)
         self.kinematic_speed = 0.0
         self.commanded_throttle = 0.0
         self.commanded_steering = 0.0
@@ -282,6 +313,7 @@ class World:
             self.obstacles.append(obstacle)
 
         self.scene.build()
+        self._reset_gps_sensor(np.asarray(self.car_pos[:2], dtype=np.float32))
         if self.show_viewer:
             self.scene.viewer.register_keybinds(
                 Keybind(
@@ -317,9 +349,12 @@ class World:
         )
         self.goal_size = GOAL_SIZE
         self.obstacle_size = OBSTACLE_SIZE
-        car_pos, goal_pos, obstacle_positions, teacher_obstacles = self._sample_layout()
+        car_pos, car_yaw, goal_pos, obstacle_positions, teacher_obstacles = (
+            self._sample_layout()
+        )
         self._build_scene_from_layout(
             car_pos=car_pos,
+            car_yaw=car_yaw,
             goal_pos=goal_pos,
             obstacle_positions=obstacle_positions,
             teacher_obstacles=teacher_obstacles,
@@ -371,6 +406,96 @@ class World:
         self.robot_view_enabled = not self.robot_view_enabled
         self._apply_viewer_camera_pose()
 
+    def _reported_gps_accuracy(self) -> float:
+        return float(
+            min(
+                self.gps_sensor_config.max_horizontal_accuracy_m,
+                np.hypot(
+                    self.gps_sensor_config.position_noise_std_m,
+                    float(np.linalg.norm(self.gps_bias)),
+                ),
+            )
+        )
+
+    def _refresh_gps_measurement(
+        self,
+        true_xy: np.ndarray,
+        *,
+        apply_bias_walk: bool,
+    ) -> None:
+        if apply_bias_walk:
+            self.gps_bias = np.asarray(
+                self.gps_bias
+                + self.np_rng.normal(
+                    0.0, self.gps_sensor_config.bias_walk_std_m, size=2
+                ),
+                dtype=np.float32,
+            )
+        measurement_noise = np.asarray(
+            self.np_rng.normal(
+                0.0, self.gps_sensor_config.position_noise_std_m, size=2
+            ),
+            dtype=np.float32,
+        )
+        self.gps_position = np.asarray(true_xy, dtype=np.float32) + self.gps_bias + measurement_noise
+        self.gps_valid = True
+        self.gps_age_s = 0.0
+        self.gps_horizontal_accuracy = self._reported_gps_accuracy()
+
+    def _start_gps_outage(self) -> None:
+        outage_duration_s = float(
+            self.np_rng.uniform(*self.gps_sensor_config.outage_duration_range_s)
+        )
+        self.gps_outage_remaining_steps = max(1, int(round(outage_duration_s / SIM_DT)))
+        self.gps_valid = False
+
+    def _reset_gps_sensor(self, true_xy: np.ndarray) -> None:
+        self.sim_step_index = 0
+        self.gps_update_interval_steps = max(
+            1, int(round(self.gps_sensor_config.update_period_s / SIM_DT))
+        )
+        self.gps_last_update_step = 0
+        self.gps_outage_remaining_steps = 0
+        self.gps_bias = np.asarray(
+            self.np_rng.normal(0.0, self.gps_sensor_config.initial_bias_std_m, size=2),
+            dtype=np.float32,
+        )
+        self.gps_position = np.asarray(true_xy, dtype=np.float32)
+        self.gps_valid = True
+        self.gps_age_s = 0.0
+        self.gps_horizontal_accuracy = self.gps_sensor_config.position_noise_std_m
+        self._refresh_gps_measurement(true_xy, apply_bias_walk=False)
+
+    def _update_gps_sensor(self) -> None:
+        if self.gps_outage_remaining_steps > 0:
+            self.gps_outage_remaining_steps -= 1
+            self.gps_valid = False
+            self.gps_age_s += SIM_DT
+            self.gps_horizontal_accuracy = min(
+                self.gps_sensor_config.max_horizontal_accuracy_m,
+                self.gps_horizontal_accuracy
+                + self.gps_sensor_config.stale_accuracy_growth_m_per_s * SIM_DT,
+            )
+            return
+
+        if self.sim_step_index - self.gps_last_update_step < self.gps_update_interval_steps:
+            self.gps_age_s += SIM_DT
+            return
+
+        self.gps_last_update_step = self.sim_step_index
+        if self.np_rng.random() < self.gps_sensor_config.outage_probability_per_update:
+            self._start_gps_outage()
+            self.gps_age_s += SIM_DT
+            self.gps_horizontal_accuracy = min(
+                self.gps_sensor_config.max_horizontal_accuracy_m,
+                self.gps_horizontal_accuracy
+                + self.gps_sensor_config.stale_accuracy_growth_m_per_s * SIM_DT,
+            )
+            return
+
+        true_xy = np.asarray(self.car.get_pos(), dtype=np.float32)[:2]
+        self._refresh_gps_measurement(true_xy, apply_bias_walk=True)
+
     def get_observation(self) -> dict[str, np.ndarray]:
         camera_pos, camera_lookat = self._camera_pose_from_car()
         self.camera.set_pose(pos=camera_pos, lookat=camera_lookat, up=DEFAULT_VIEWER_UP)
@@ -392,6 +517,12 @@ class World:
             "obstacle_positions": np.asarray(self.obstacle_positions, dtype=np.float32),
             "obstacle_size": np.asarray(self.obstacle_size, dtype=np.float32),
             "last_action": self.last_action.copy(),
+            "gps_position": np.asarray(self.gps_position, dtype=np.float32),
+            "gps_valid": np.asarray([float(self.gps_valid)], dtype=np.float32),
+            "gps_age_s": np.asarray([self.gps_age_s], dtype=np.float32),
+            "gps_horizontal_accuracy": np.asarray(
+                [self.gps_horizontal_accuracy], dtype=np.float32
+            ),
             "image": self.camera.render(
                 rgb=True, depth=False, segmentation=False, normal=False
             )[0],
@@ -504,6 +635,8 @@ class World:
 
     def step(self) -> dict[str, np.ndarray]:
         self.scene.step()
+        self.sim_step_index += 1
+        self._update_gps_sensor()
         return self.get_observation()
 
     def close(self) -> None:
@@ -514,17 +647,23 @@ class World:
     def reset(self, seed: int | None = None) -> dict[str, np.ndarray]:
         next_seed = self.seed if seed is None else seed
         self._set_seed(next_seed)
-        car_pos, goal_pos, obstacle_positions, teacher_obstacles = self._sample_layout()
+        car_pos, car_yaw, goal_pos, obstacle_positions, teacher_obstacles = (
+            self._sample_layout()
+        )
 
         self.scene.reset()
         self.car_pos = car_pos
+        self.car_yaw = float(car_yaw)
         self.goal_pos = goal_pos
         self.obstacle_positions = list(obstacle_positions)
         self.teacher_obstacles = list(teacher_obstacles)
         self.spawned_objects = [(self.car_pos, self.spawn_car_size), (self.goal_pos, self.goal_size)]
 
         self.car.set_pos(np.asarray(self.car_pos, dtype=np.float32), zero_velocity=True)
-        self.car.set_quat(np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32), zero_velocity=True)
+        self.car.set_quat(
+            np.asarray(_quat_from_yaw(self.car_yaw), dtype=np.float32),
+            zero_velocity=True,
+        )
         self.car.set_dofs_position(
             np.zeros(len(self.steering_dofs), dtype=np.float32),
             dofs_idx_local=self.steering_dofs,
@@ -541,9 +680,10 @@ class World:
             self.spawned_objects.append((obstacle_pos, self.obstacle_size))
 
         self.kinematic_xy = np.array(self.car_pos[:2], dtype=np.float32)
-        self.kinematic_yaw = 0.0
+        self.kinematic_yaw = float(self.car_yaw)
         self.kinematic_speed = 0.0
         self.commanded_throttle = 0.0
         self.commanded_steering = 0.0
         self.last_action = np.zeros(2, dtype=np.float32)
+        self._reset_gps_sensor(np.asarray(self.car_pos[:2], dtype=np.float32))
         return self.get_observation()

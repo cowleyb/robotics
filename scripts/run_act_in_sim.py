@@ -8,9 +8,11 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.control_utils import predict_action
 
-from sim.test import build_lerobot_observation
+from sim.policy_observation import build_lerobot_observation, validate_features
 from sim.stages import find_latest_checkpoint, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
+
+DEFAULT_ACT_TEMPORAL_ENSEMBLE_COEFF = 0.01
 
 
 def unnormalize_action(action: np.ndarray) -> tuple[float, float]:
@@ -42,8 +44,22 @@ def main() -> None:
     checkpoint = args.checkpoint or find_latest_checkpoint(stage_config)
     instruction = args.instruction or stage_config.instruction
     policy_config = PreTrainedConfig.from_pretrained(checkpoint)
+    validate_features(
+        policy_config.input_features,
+        source=f"Checkpoint at {checkpoint}",
+    )
+    if (
+        policy_config.type == "act"
+        and getattr(policy_config, "chunk_size", 1) > 1
+        and getattr(policy_config, "temporal_ensemble_coeff", None) is None
+    ):
+        policy_config.temporal_ensemble_coeff = DEFAULT_ACT_TEMPORAL_ENSEMBLE_COEFF
     policy_class = get_policy_class(policy_config.type)
     policy = policy_class.from_pretrained(checkpoint, config=policy_config)
+    if getattr(policy.config, "temporal_ensemble_coeff", None) is None:
+        policy.config.temporal_ensemble_coeff = getattr(
+            policy_config, "temporal_ensemble_coeff", None
+        )
     device = torch.device(policy.config.device)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config,
@@ -60,6 +76,7 @@ def main() -> None:
         instruction=instruction,
         show_viewer=not args.headless,
         obstacle_count=stage_config.obstacle_count,
+        gps_sensor_config=stage_config.gps_sensor_config,
     )
     successes = 0
     collisions = 0
@@ -67,6 +84,7 @@ def main() -> None:
 
     print(f"{stage_config.label}")
     print(f"checkpoint: {checkpoint}")
+    print(f"temporal ensemble coeff: {policy.config.temporal_ensemble_coeff}")
     try:
         for episode_idx in range(args.episodes):
             if base_seed is not None:

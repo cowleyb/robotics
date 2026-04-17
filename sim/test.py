@@ -3,9 +3,13 @@ from pathlib import Path
 import secrets
 
 import numpy as np
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
+from lerobot.datasets.dataset_writer import DatasetWriter
+from lerobot.datasets.utils import DEFAULT_FEATURES
 
 from genesis.vis.keybindings import Key, KeyAction, Keybind
+from sim.policy_observation import build_lerobot_observation
 from sim.stages import StageConfig, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
@@ -25,19 +29,40 @@ def normalize_action(throttle: float, steering: float) -> dict[str, float]:
     }
 
 
-def rotate_world_vector_to_car_frame(
-    vector_xy: np.ndarray, car_quaternion: np.ndarray
-) -> np.ndarray:
-    w, x, y, z = car_quaternion
-    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    cos_yaw = np.cos(yaw)
-    sin_yaw = np.sin(yaw)
-    return np.asarray(
-        [
-            cos_yaw * vector_xy[0] + sin_yaw * vector_xy[1],
-            -sin_yaw * vector_xy[0] + cos_yaw * vector_xy[1],
-        ],
-        dtype=np.float32,
+def unnormalize_action(action: np.ndarray) -> tuple[float, float]:
+    throttle = float(np.clip(action[0], -1.0, 1.0))
+    steering = float(np.clip(action[1], -1.0, 1.0))
+    if throttle >= 0.0:
+        throttle *= DRIVE_LIMITS.max_forward_wheel_speed
+    else:
+        throttle *= DRIVE_LIMITS.max_reverse_wheel_speed
+    steering *= MAX_STEERING_ANGLE
+    return throttle, steering
+
+
+def maybe_perturb_action(
+    action: np.ndarray,
+    rng: np.random.Generator,
+    perturb_prob: float,
+    throttle_std: float,
+    steering_std: float,
+) -> tuple[np.ndarray, bool]:
+    executed_action = action.copy()
+    if perturb_prob <= 0.0 or rng.random() >= perturb_prob:
+        return executed_action, False
+
+    executed_action[0] = float(
+        np.clip(executed_action[0] + rng.normal(0.0, throttle_std), -1.0, 1.0)
+    )
+    executed_action[1] = float(
+        np.clip(executed_action[1] + rng.normal(0.0, steering_std), -1.0, 1.0)
+    )
+    return executed_action, True
+
+
+def goal_distance(observation: dict[str, np.ndarray]) -> float:
+    return float(
+        np.linalg.norm(observation["goal_position"][:2] - observation["car_position"][:2])
     )
 
 
@@ -82,7 +107,9 @@ def open_lerobot_dataset(
     features: dict[str, dict[str, object]],
     stage_config: StageConfig,
 ) -> LeRobotDataset:
-    if not stage_config.dataset_root.exists():
+    expected_features = {**features, **DEFAULT_FEATURES}
+    metadata_path = stage_config.dataset_root / "meta" / "info.json"
+    if not metadata_path.exists():
         return LeRobotDataset.create(
             repo_id=stage_config.repo_id,
             fps=100,
@@ -91,71 +118,55 @@ def open_lerobot_dataset(
             use_videos=False,
         )
 
+    meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+    meta.repo_id = stage_config.repo_id
+    meta._requested_root = stage_config.dataset_root
+    meta.root = stage_config.dataset_root
+    meta.revision = CODEBASE_VERSION
+    meta._pq_writer = None
+    meta.latest_episode = None
+    meta._metadata_buffer = []
+    meta._metadata_buffer_size = 10
+    meta._finalized = False
+    try:
+        meta._load_metadata()
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        raise FileNotFoundError(
+            f"Existing dataset at {stage_config.dataset_root} is incomplete. "
+            "Delete the partial dataset and record again, or recreate it from scratch."
+        ) from exc
+    if meta.features != expected_features:
+        raise ValueError(
+            f"Existing dataset schema at {stage_config.dataset_root} does not match "
+            "the current GPS+vision recorder schema. Record into a fresh dataset "
+            "directory or remove the old dataset before collecting again."
+        )
+
     dataset = LeRobotDataset.__new__(LeRobotDataset)
     dataset.repo_id = stage_config.repo_id
-    dataset.root = stage_config.dataset_root
-    dataset.revision = None
+    dataset._requested_root = stage_config.dataset_root
+    dataset.root = meta.root
+    dataset.revision = meta.revision
+    dataset.tolerance_s = 1e-4
     dataset.image_transforms = None
     dataset.delta_timestamps = None
     dataset.episodes = None
-    dataset.tolerance_s = 1e-4
-    dataset.video_backend = None
-    dataset.delta_indices = None
-    dataset.batch_encoding_size = 1
-    dataset.episodes_since_last_encoding = 0
-    dataset.vcodec = "libsvtav1"
+    dataset._video_backend = "pyav"
+    dataset._batch_encoding_size = 1
+    dataset._vcodec = "libsvtav1"
     dataset._encoder_threads = None
-    dataset.image_writer = None
-    dataset.episode_buffer = None
-    dataset.writer = None
-    dataset.latest_episode = None
-    dataset._current_file_start_frame = None
-    dataset._streaming_encoder = None
-    dataset.meta = LeRobotDatasetMetadata(
-        repo_id=stage_config.repo_id,
-        root=stage_config.dataset_root,
-        force_cache_sync=False,
+    dataset.reader = None
+    dataset.meta = meta
+    dataset.writer = DatasetWriter(
+        meta=meta,
+        root=meta.root,
+        vcodec=dataset._vcodec,
+        encoder_threads=dataset._encoder_threads,
+        batch_encoding_size=dataset._batch_encoding_size,
+        initial_frames=meta.total_frames,
     )
-    dataset._lazy_loading = False
-    dataset._recorded_frames = dataset.meta.total_frames
-    dataset._writer_closed_for_reading = False
-    dataset.hf_dataset = dataset.create_hf_dataset()
-    dataset._absolute_to_relative_idx = None
-    dataset.episode_buffer = dataset.create_episode_buffer()
+    dataset._is_finalized = False
     return dataset
-
-
-def build_lerobot_observation(
-    observation: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    goal_delta_world = np.asarray(
-        observation["goal_position"][:2] - observation["car_position"][:2],
-        dtype=np.float32,
-    )
-    goal_delta = rotate_world_vector_to_car_frame(
-        goal_delta_world,
-        np.asarray(observation["car_quaternion"], dtype=np.float32),
-    )
-    car_velocity = rotate_world_vector_to_car_frame(
-        np.asarray(observation["car_linear_velocity"][:2], dtype=np.float32),
-        np.asarray(observation["car_quaternion"], dtype=np.float32),
-    )
-    observation_state = np.concatenate(
-        (
-            goal_delta,
-            car_velocity,
-            np.asarray(observation["steering_position"], dtype=np.float32),
-            np.asarray(observation["last_action"], dtype=np.float32),
-        ),
-        dtype=np.float32,
-    )
-    return {
-        "observation.state": np.ascontiguousarray(observation_state),
-        "observation.images.front": np.ascontiguousarray(
-            observation["image"],
-            dtype=np.uint8,
-        ),
-    }
 
 
 def build_lerobot_frame(
@@ -260,10 +271,23 @@ def main() -> None:
         type=int,
         default=1,
     )
+    parser.add_argument("--action_noise_prob", type=float, default=0.05)
+    parser.add_argument("--action_noise_throttle_std", type=float, default=0.05)
+    parser.add_argument("--action_noise_steering_std", type=float, default=0.15)
+    parser.add_argument("--save_failures", action="store_true")
+    parser.add_argument("--min_failure_progress", type=float, default=0.75)
     args = parser.parse_args()
 
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
+    if not 0.0 <= args.action_noise_prob <= 1.0:
+        raise ValueError("--action_noise_prob must be in [0, 1]")
+    if args.action_noise_throttle_std < 0.0:
+        raise ValueError("--action_noise_throttle_std must be non-negative")
+    if args.action_noise_steering_std < 0.0:
+        raise ValueError("--action_noise_steering_std must be non-negative")
+    if not 0.0 <= args.min_failure_progress <= 1.0:
+        raise ValueError("--min_failure_progress must be in [0, 1]")
 
     stage_config = get_stage_config(args.stage)
     instruction = args.instruction or stage_config.instruction
@@ -278,6 +302,7 @@ def main() -> None:
         instruction=instruction,
         show_viewer=args.show_viewer,
         obstacle_count=stage_config.obstacle_count,
+        gps_sensor_config=stage_config.gps_sensor_config,
     )
     try:
         for episode_idx in range(args.episodes):
@@ -293,6 +318,7 @@ def main() -> None:
             else:
                 observation = world.reset(seed=seed)
             print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
+            episode_noise_rng = np.random.default_rng(world.seed)
 
             step_count = 0
             trajectory = []
@@ -309,7 +335,9 @@ def main() -> None:
             reached_goal = False
             hit_obstacle = False
             timed_out = False
+            perturbed_steps = 0
             planning_error: RuntimeError | None = None
+            initial_goal_distance = goal_distance(observation)
             while True:
                 if args.manual:
                     throttle = (
@@ -333,11 +361,26 @@ def main() -> None:
                 normalized_action = normalize_action(
                     throttle=throttle, steering=steering
                 )
-                world.last_action = np.array(
+                teacher_action = np.array(
                     [normalized_action["throttle"], normalized_action["steering"]],
                     dtype=np.float32,
                 )
-                world.move_car(throttle=throttle, steering=steering)
+                executed_action = teacher_action.copy()
+                if not args.manual:
+                    executed_action, was_perturbed = maybe_perturb_action(
+                        action=executed_action,
+                        rng=episode_noise_rng,
+                        perturb_prob=args.action_noise_prob,
+                        throttle_std=args.action_noise_throttle_std,
+                        steering_std=args.action_noise_steering_std,
+                    )
+                    perturbed_steps += int(was_perturbed)
+                world.last_action = executed_action
+                executed_throttle, executed_steering = unnormalize_action(executed_action)
+                world.move_car(
+                    throttle=executed_throttle,
+                    steering=executed_steering,
+                )
                 next_observation = world.step()
                 step_count += 1
                 reached_goal = world.goal_reached()
@@ -370,10 +413,31 @@ def main() -> None:
                 failed_seeds.append(world.seed)
                 print(f"episode {episode_idx + 1}: skipped saving planner failure")
                 continue
-            if not reached_goal:
+
+            final_goal_distance = goal_distance(observation)
+            progress = max(
+                0.0,
+                min(
+                    1.0,
+                    1.0 - final_goal_distance / max(initial_goal_distance, 1e-6),
+                ),
+            )
+            print(
+                f"episode {episode_idx + 1}: perturbed steps={perturbed_steps}, "
+                f"progress={progress:.3f}"
+            )
+
+            if not reached_goal and not (
+                args.save_failures and progress >= args.min_failure_progress
+            ):
                 failed_seeds.append(world.seed)
                 print(f"episode {episode_idx + 1}: skipped saving unsuccessful rollout")
                 continue
+            if not reached_goal:
+                print(
+                    f"episode {episode_idx + 1}: saving failure rollout with "
+                    f"progress {progress:.3f}"
+                )
 
             output_path = save_episode(
                 trajectory=trajectory,
