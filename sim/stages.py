@@ -12,12 +12,22 @@ TRAIN_OUTPUTS_ROOT = PROJECT_ROOT / "outputs" / "train"
 
 
 @dataclass(frozen=True)
+class RecoveryDataConfig:
+    perturb_prob: float
+    throttle_std: float
+    steering_std: float
+    burst_length_range_steps: tuple[int, int]
+    recovery_length_range_steps: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class StageConfig:
     number: int
     name: str
     instruction: str
     obstacle_count: int
     gps_sensor_config: GPSSensorConfig
+    recovery_data_config: RecoveryDataConfig
 
     @property
     def label(self) -> str:
@@ -52,6 +62,13 @@ STAGE_CONFIGS = {
             outage_probability_per_update=0.02,
             outage_duration_range_s=(0.4, 1.0),
         ),
+        recovery_data_config=RecoveryDataConfig(
+            perturb_prob=0.06,
+            throttle_std=0.08,
+            steering_std=0.25,
+            burst_length_range_steps=(2, 5),
+            recovery_length_range_steps=(20, 45),
+        ),
     ),
     2: StageConfig(
         number=2,
@@ -65,6 +82,13 @@ STAGE_CONFIGS = {
             outage_probability_per_update=0.03,
             outage_duration_range_s=(0.6, 1.5),
             stale_accuracy_growth_m_per_s=0.9,
+        ),
+        recovery_data_config=RecoveryDataConfig(
+            perturb_prob=0.1,
+            throttle_std=0.1,
+            steering_std=0.35,
+            burst_length_range_steps=(3, 7),
+            recovery_length_range_steps=(30, 70),
         ),
     ),
     3: StageConfig(
@@ -80,6 +104,13 @@ STAGE_CONFIGS = {
             outage_probability_per_update=0.06,
             outage_duration_range_s=(1.0, 2.5),
             stale_accuracy_growth_m_per_s=1.2,
+        ),
+        recovery_data_config=RecoveryDataConfig(
+            perturb_prob=0.12,
+            throttle_std=0.12,
+            steering_std=0.45,
+            burst_length_range_steps=(4, 10),
+            recovery_length_range_steps=(40, 100),
         ),
     ),
 }

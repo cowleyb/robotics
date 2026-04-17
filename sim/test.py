@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import secrets
 
@@ -10,7 +11,7 @@ from lerobot.datasets.utils import DEFAULT_FEATURES
 
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 from sim.policy_observation import build_lerobot_observation
-from sim.stages import StageConfig, get_stage_config
+from sim.stages import RecoveryDataConfig, StageConfig, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
 
@@ -40,24 +41,78 @@ def unnormalize_action(action: np.ndarray) -> tuple[float, float]:
     return throttle, steering
 
 
-def maybe_perturb_action(
-    action: np.ndarray,
-    rng: np.random.Generator,
-    perturb_prob: float,
-    throttle_std: float,
-    steering_std: float,
-) -> tuple[np.ndarray, bool]:
-    executed_action = action.copy()
-    if perturb_prob <= 0.0 or rng.random() >= perturb_prob:
-        return executed_action, False
+@dataclass
+class RecoveryPerturbationController:
+    rng: np.random.Generator
+    recovery_data_config: RecoveryDataConfig
+    active_burst_steps_remaining: int = 0
+    recovery_steps_remaining: int = 0
+    burst_offset: np.ndarray | None = None
 
-    executed_action[0] = float(
-        np.clip(executed_action[0] + rng.normal(0.0, throttle_std), -1.0, 1.0)
-    )
-    executed_action[1] = float(
-        np.clip(executed_action[1] + rng.normal(0.0, steering_std), -1.0, 1.0)
-    )
-    return executed_action, True
+    def _sample_step_count(self, step_range: tuple[int, int]) -> int:
+        min_steps, max_steps = step_range
+        if max_steps <= 0:
+            return 0
+        return int(self.rng.integers(min_steps, max_steps + 1))
+
+    def _start_burst(self) -> bool:
+        self.active_burst_steps_remaining = self._sample_step_count(
+            self.recovery_data_config.burst_length_range_steps
+        )
+        if self.active_burst_steps_remaining <= 0:
+            self.burst_offset = None
+            return False
+        self.burst_offset = np.asarray(
+            [
+                self.rng.normal(0.0, self.recovery_data_config.throttle_std),
+                self.rng.normal(0.0, self.recovery_data_config.steering_std),
+            ],
+            dtype=np.float32,
+        )
+        return True
+
+    def sample_action(self, action: np.ndarray) -> tuple[np.ndarray, bool, bool]:
+        executed_action = action.copy()
+        if self.active_burst_steps_remaining > 0:
+            if self.burst_offset is None:
+                raise RuntimeError("burst_offset must be set while a burst is active")
+            executed_action = np.clip(executed_action + self.burst_offset, -1.0, 1.0)
+            self.active_burst_steps_remaining -= 1
+            if self.active_burst_steps_remaining == 0:
+                self.recovery_steps_remaining = self._sample_step_count(
+                    self.recovery_data_config.recovery_length_range_steps
+                )
+                self.burst_offset = None
+            return executed_action.astype(np.float32), True, False
+
+        if self.recovery_steps_remaining > 0:
+            self.recovery_steps_remaining -= 1
+            return executed_action, False, True
+
+        if (
+            self.recovery_data_config.perturb_prob <= 0.0
+            or self.rng.random() >= self.recovery_data_config.perturb_prob
+        ):
+            return executed_action, False, False
+
+        if not self._start_burst():
+            return executed_action, False, False
+        return self.sample_action(action)
+
+
+def resolve_step_range(
+    min_steps_override: int | None,
+    max_steps_override: int | None,
+    default_range: tuple[int, int],
+    flag_prefix: str,
+) -> tuple[int, int]:
+    min_steps = default_range[0] if min_steps_override is None else min_steps_override
+    max_steps = default_range[1] if max_steps_override is None else max_steps_override
+    if min_steps < 0 or max_steps < 0:
+        raise ValueError(f"{flag_prefix} values must be non-negative")
+    if min_steps > max_steps:
+        raise ValueError(f"{flag_prefix} min must be <= max")
+    return min_steps, max_steps
 
 
 def goal_distance(observation: dict[str, np.ndarray]) -> float:
@@ -271,31 +326,78 @@ def main() -> None:
         type=int,
         default=1,
     )
-    parser.add_argument("--action_noise_prob", type=float, default=0.05)
-    parser.add_argument("--action_noise_throttle_std", type=float, default=0.05)
-    parser.add_argument("--action_noise_steering_std", type=float, default=0.15)
+    parser.add_argument("--action_noise_prob", type=float, default=None)
+    parser.add_argument("--action_noise_throttle_std", type=float, default=None)
+    parser.add_argument("--action_noise_steering_std", type=float, default=None)
+    parser.add_argument("--action_noise_burst_min_steps", type=int, default=None)
+    parser.add_argument("--action_noise_burst_max_steps", type=int, default=None)
+    parser.add_argument("--action_recovery_min_steps", type=int, default=None)
+    parser.add_argument("--action_recovery_max_steps", type=int, default=None)
     parser.add_argument("--save_failures", action="store_true")
     parser.add_argument("--min_failure_progress", type=float, default=0.75)
     args = parser.parse_args()
 
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
-    if not 0.0 <= args.action_noise_prob <= 1.0:
-        raise ValueError("--action_noise_prob must be in [0, 1]")
-    if args.action_noise_throttle_std < 0.0:
-        raise ValueError("--action_noise_throttle_std must be non-negative")
-    if args.action_noise_steering_std < 0.0:
-        raise ValueError("--action_noise_steering_std must be non-negative")
     if not 0.0 <= args.min_failure_progress <= 1.0:
         raise ValueError("--min_failure_progress must be in [0, 1]")
 
     stage_config = get_stage_config(args.stage)
+    recovery_data_defaults = stage_config.recovery_data_config
+    action_noise_prob = (
+        recovery_data_defaults.perturb_prob
+        if args.action_noise_prob is None
+        else args.action_noise_prob
+    )
+    action_noise_throttle_std = (
+        recovery_data_defaults.throttle_std
+        if args.action_noise_throttle_std is None
+        else args.action_noise_throttle_std
+    )
+    action_noise_steering_std = (
+        recovery_data_defaults.steering_std
+        if args.action_noise_steering_std is None
+        else args.action_noise_steering_std
+    )
+    action_noise_burst_steps = resolve_step_range(
+        min_steps_override=args.action_noise_burst_min_steps,
+        max_steps_override=args.action_noise_burst_max_steps,
+        default_range=recovery_data_defaults.burst_length_range_steps,
+        flag_prefix="--action_noise_burst",
+    )
+    action_recovery_steps = resolve_step_range(
+        min_steps_override=args.action_recovery_min_steps,
+        max_steps_override=args.action_recovery_max_steps,
+        default_range=recovery_data_defaults.recovery_length_range_steps,
+        flag_prefix="--action_recovery",
+    )
+    if not 0.0 <= action_noise_prob <= 1.0:
+        raise ValueError("--action_noise_prob must be in [0, 1]")
+    if action_noise_throttle_std < 0.0:
+        raise ValueError("--action_noise_throttle_std must be non-negative")
+    if action_noise_steering_std < 0.0:
+        raise ValueError("--action_noise_steering_std must be non-negative")
+    recovery_data_config = RecoveryDataConfig(
+        perturb_prob=action_noise_prob,
+        throttle_std=action_noise_throttle_std,
+        steering_std=action_noise_steering_std,
+        burst_length_range_steps=action_noise_burst_steps,
+        recovery_length_range_steps=action_recovery_steps,
+    )
     instruction = args.instruction or stage_config.instruction
     base_seed = int(args.seed) if args.seed is not None else None
     output_path = None
     saved_episodes = 0
     failed_seeds = []
     print(f"{stage_config.label} dataset: {stage_config.dataset_root}")
+    print(
+        "recovery perturbations: "
+        f"prob={recovery_data_config.perturb_prob:.2f}, "
+        f"throttle_std={recovery_data_config.throttle_std:.2f}, "
+        f"steering_std={recovery_data_config.steering_std:.2f}, "
+        f"burst_steps={recovery_data_config.burst_length_range_steps}, "
+        f"recovery_steps={recovery_data_config.recovery_length_range_steps}"
+    )
     initial_seed = base_seed if base_seed is not None else int(secrets.randbelow(2**31 - 1))
     world = World(
         seed=initial_seed,
@@ -319,6 +421,10 @@ def main() -> None:
                 observation = world.reset(seed=seed)
             print(f"episode {episode_idx + 1}/{args.episodes} seed: {world.seed}")
             episode_noise_rng = np.random.default_rng(world.seed)
+            perturbation_controller = RecoveryPerturbationController(
+                rng=episode_noise_rng,
+                recovery_data_config=recovery_data_config,
+            )
 
             step_count = 0
             trajectory = []
@@ -336,6 +442,7 @@ def main() -> None:
             hit_obstacle = False
             timed_out = False
             perturbed_steps = 0
+            recovery_steps = 0
             planning_error: RuntimeError | None = None
             initial_goal_distance = goal_distance(observation)
             while True:
@@ -367,14 +474,13 @@ def main() -> None:
                 )
                 executed_action = teacher_action.copy()
                 if not args.manual:
-                    executed_action, was_perturbed = maybe_perturb_action(
-                        action=executed_action,
-                        rng=episode_noise_rng,
-                        perturb_prob=args.action_noise_prob,
-                        throttle_std=args.action_noise_throttle_std,
-                        steering_std=args.action_noise_steering_std,
+                    executed_action, was_perturbed, was_recovery = (
+                        perturbation_controller.sample_action(
+                            action=executed_action,
+                        )
                     )
                     perturbed_steps += int(was_perturbed)
+                    recovery_steps += int(was_recovery)
                 world.last_action = executed_action
                 executed_throttle, executed_steering = unnormalize_action(executed_action)
                 world.move_car(
@@ -424,7 +530,7 @@ def main() -> None:
             )
             print(
                 f"episode {episode_idx + 1}: perturbed steps={perturbed_steps}, "
-                f"progress={progress:.3f}"
+                f"recovery steps={recovery_steps}, progress={progress:.3f}"
             )
 
             if not reached_goal and not (

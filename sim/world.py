@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import genesis as gs
@@ -34,6 +35,9 @@ DEFAULT_VIEWER_POS = (0.0, 0.0, 10.0)
 DEFAULT_VIEWER_LOOKAT = (0.0, 0.0, 0.0)
 DEFAULT_VIEWER_UP = (0.0, 1.0, 0.0)
 SIM_DT = 0.01
+SPAWN_SAMPLE_ATTEMPTS = 500
+START_GOAL_MIN_DISTANCE = 1.75
+START_GOAL_MAX_DISTANCE = 5.5
 
 
 @dataclass(frozen=True)
@@ -114,11 +118,12 @@ class World:
             tuple[tuple[float, float, float], tuple[float, float, float]]
         ]
         | None = None,
+        validator: Callable[[tuple[float, float, float]], bool] | None = None,
     ) -> tuple[float, float, float]:
         existing_objects = (
             self.spawned_objects if spawned_objects is None else spawned_objects
         )
-        while True:
+        for _ in range(SPAWN_SAMPLE_ATTEMPTS):
             position = (
                 self.rng.uniform(*x_range),
                 self.rng.uniform(*y_range),
@@ -128,8 +133,89 @@ class World:
                 self._check_overlap(position, size, existing_pos, existing_size)
                 for existing_pos, existing_size in existing_objects
             )
-            if not overlap:
-                return position
+            if overlap:
+                continue
+            if validator is not None and not validator(position):
+                continue
+            return position
+        raise RuntimeError(
+            "Failed to sample a collision-free spawn layout within the arena bounds."
+        )
+
+    @staticmethod
+    def _centered_spawn_ranges(
+        size: tuple[float, float, float]
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        half_x = 0.5 * float(size[0])
+        half_y = 0.5 * float(size[1])
+        return (
+            (-SPAWN_RANGE + half_x, SPAWN_RANGE - half_x),
+            (-SPAWN_RANGE + half_y, SPAWN_RANGE - half_y),
+        )
+
+    def _sample_car_position(
+        self,
+        spawned_objects: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ],
+    ) -> tuple[float, float, float]:
+        x_range, y_range = self._centered_spawn_ranges(self.spawn_car_size)
+        return self._sample_spawn_position(
+            size=self.spawn_car_size,
+            x_range=x_range,
+            y_range=y_range,
+            z=_CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
+            spawned_objects=spawned_objects,
+        )
+
+    def _sample_goal_position(
+        self,
+        car_pos: tuple[float, float, float],
+        spawned_objects: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ],
+    ) -> tuple[float, float, float]:
+        x_range, y_range = self._centered_spawn_ranges(self.goal_size)
+        goal_min_distance = max(
+            START_GOAL_MIN_DISTANCE,
+            1.25 * float(np.hypot(self.spawn_car_size[0], self.spawn_car_size[1])),
+        )
+
+        def valid_goal_position(position: tuple[float, float, float]) -> bool:
+            goal_distance = float(
+                np.linalg.norm(
+                    np.asarray(position[:2], dtype=np.float32)
+                    - np.asarray(car_pos[:2], dtype=np.float32)
+                )
+            )
+            return goal_min_distance <= goal_distance <= START_GOAL_MAX_DISTANCE
+
+        return self._sample_spawn_position(
+            size=self.goal_size,
+            x_range=x_range,
+            y_range=y_range,
+            z=GOAL_HEIGHT,
+            spawned_objects=spawned_objects,
+            validator=valid_goal_position,
+        )
+
+    def _sample_start_yaw(self) -> float:
+        return float(self.rng.uniform(-np.pi, np.pi))
+
+    def _sample_obstacle_position(
+        self,
+        spawned_objects: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ],
+    ) -> tuple[float, float, float]:
+        x_range, y_range = self._centered_spawn_ranges(self.obstacle_size)
+        return self._sample_spawn_position(
+            size=self.obstacle_size,
+            x_range=x_range,
+            y_range=y_range,
+            z=OBSTACLE_HEIGHT,
+            spawned_objects=spawned_objects,
+        )
 
     def _make_teacher_planner(self) -> TeacherPlanner:
         return TeacherPlanner(
@@ -162,32 +248,16 @@ class World:
         spawned_objects: list[
             tuple[tuple[float, float, float], tuple[float, float, float]]
         ] = []
-        car_pos = (
-            self.rng.uniform(-SPAWN_RANGE, 0.0),
-            self.rng.uniform(-SPAWN_RANGE, 0.0),
-            _CAR_GEOM.wheel_radius + CAR_SPAWN_HEIGHT_OFFSET,
-        )
-        car_yaw = self.rng.uniform(-np.pi, np.pi)
+        car_pos = self._sample_car_position(spawned_objects)
+        car_yaw = self._sample_start_yaw()
         spawned_objects.append((car_pos, self.spawn_car_size))
 
-        goal_pos = self._sample_spawn_position(
-            size=self.goal_size,
-            x_range=(0.0, SPAWN_RANGE),
-            y_range=(0.0, SPAWN_RANGE),
-            z=GOAL_HEIGHT,
-            spawned_objects=spawned_objects,
-        )
+        goal_pos = self._sample_goal_position(car_pos, spawned_objects)
         spawned_objects.append((goal_pos, self.goal_size))
 
         obstacle_positions = []
         for _ in range(self.obstacle_count):
-            obstacle_pos = self._sample_spawn_position(
-                size=self.obstacle_size,
-                x_range=(-SPAWN_RANGE, SPAWN_RANGE),
-                y_range=(-SPAWN_RANGE, SPAWN_RANGE),
-                z=OBSTACLE_HEIGHT,
-                spawned_objects=spawned_objects,
-            )
+            obstacle_pos = self._sample_obstacle_position(spawned_objects)
             spawned_objects.append((obstacle_pos, self.obstacle_size))
             obstacle_positions.append(obstacle_pos)
 
