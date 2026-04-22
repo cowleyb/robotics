@@ -17,6 +17,7 @@ from sim.stages import find_latest_checkpoint, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
 DEFAULT_ACT_TEMPORAL_ENSEMBLE_COEFF = 0.01
+DEFAULT_EPISODE_MAX_STEPS = 600
 
 
 def unnormalize_action(action: np.ndarray) -> tuple[float, float]:
@@ -37,13 +38,15 @@ def main() -> None:
     parser.add_argument("--instruction", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--max_steps", type=int, default=DEFAULT_EPISODE_MAX_STEPS)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--gps_dropout_prob", type=float, default=None)
     args = parser.parse_args()
 
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
+    if args.max_steps < 1:
+        raise ValueError("--max_steps must be at least 1")
     if args.gps_dropout_prob is not None and not 0.0 <= args.gps_dropout_prob <= 1.0:
         raise ValueError("--gps_dropout_prob must be in [0, 1]")
 
@@ -95,6 +98,7 @@ def main() -> None:
         "policy gps dropout probability: "
         f"{0.0 if args.gps_dropout_prob is None else args.gps_dropout_prob:.3f}"
     )
+    print(f"max steps per episode: {args.max_steps}")
     print(f"temporal ensemble coeff: {policy.config.temporal_ensemble_coeff}")
     try:
         for episode_idx in range(args.episodes):

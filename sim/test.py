@@ -14,6 +14,8 @@ from sim.policy_observation import build_lerobot_observation
 from sim.stages import RecoveryDataConfig, StageConfig, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
+DEFAULT_EPISODE_MAX_STEPS = 600
+
 
 def set_control(control_state: dict[str, float], key: str, value: float) -> None:
     control_state[key] = value
@@ -326,6 +328,7 @@ def main() -> None:
         type=int,
         default=1,
     )
+    parser.add_argument("--max_steps", type=int, default=DEFAULT_EPISODE_MAX_STEPS)
     parser.add_argument("--action_noise_prob", type=float, default=None)
     parser.add_argument("--action_noise_throttle_std", type=float, default=None)
     parser.add_argument("--action_noise_steering_std", type=float, default=None)
@@ -339,6 +342,8 @@ def main() -> None:
 
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
+    if args.max_steps < 1:
+        raise ValueError("--max_steps must be at least 1")
     if not 0.0 <= args.min_failure_progress <= 1.0:
         raise ValueError("--min_failure_progress must be in [0, 1]")
 
@@ -398,6 +403,7 @@ def main() -> None:
         f"burst_steps={recovery_data_config.burst_length_range_steps}, "
         f"recovery_steps={recovery_data_config.recovery_length_range_steps}"
     )
+    print(f"max steps per episode: {args.max_steps}")
     initial_seed = base_seed if base_seed is not None else int(secrets.randbelow(2**31 - 1))
     world = World(
         seed=initial_seed,
@@ -491,7 +497,7 @@ def main() -> None:
                 step_count += 1
                 reached_goal = world.goal_reached()
                 hit_obstacle = world.hit_obstacle()
-                timed_out = step_count >= 5000
+                timed_out = step_count >= args.max_steps
                 trajectory.append(
                     build_lerobot_frame(
                         observation=observation,

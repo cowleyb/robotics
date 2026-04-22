@@ -18,6 +18,33 @@ from sim.policy_observation import validate_features
 from sim.stages import get_stage_config
 
 
+class GPSDropoutPreprocessor:
+    def __init__(
+        self,
+        wrapped_preprocessor,
+        *,
+        dropout_prob: float,
+        generator: torch.Generator,
+    ) -> None:
+        self.wrapped_preprocessor = wrapped_preprocessor
+        self.dropout_prob = dropout_prob
+        self.generator = generator
+
+    def __call__(self, batch):
+        batch = apply_gps_dropout(
+            batch=batch,
+            dropout_prob=self.dropout_prob,
+            generator=self.generator,
+        )
+        return self.wrapped_preprocessor(batch)
+
+    def save_pretrained(self, *args, **kwargs):
+        return self.wrapped_preprocessor.save_pretrained(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped_preprocessor, name)
+
+
 def find_latest_checkpoint_under(output_dir: Path) -> Path:
     checkpoints = [
         path
@@ -42,16 +69,14 @@ def training_gps_dropout(dropout_prob: float, seed: int) -> Iterator[None]:
     @wraps(original_make_pre_post_processors)
     def make_pre_post_processors_with_gps_dropout(*args, **kwargs):
         preprocessor, postprocessor = original_make_pre_post_processors(*args, **kwargs)
-
-        def preprocessor_with_gps_dropout(batch):
-            batch = apply_gps_dropout(
-                batch=batch,
+        return (
+            GPSDropoutPreprocessor(
+                preprocessor,
                 dropout_prob=dropout_prob,
                 generator=generator,
-            )
-            return preprocessor(batch)
-
-        return preprocessor_with_gps_dropout, postprocessor
+            ),
+            postprocessor,
+        )
 
     lerobot_train.make_pre_post_processors = make_pre_post_processors_with_gps_dropout
     try:
