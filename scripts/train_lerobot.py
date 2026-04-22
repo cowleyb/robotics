@@ -1,15 +1,19 @@
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
+import torch
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.transforms import ImageTransformsConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.scripts.lerobot_train import train
+import lerobot.scripts.lerobot_train as lerobot_train
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
 from scripts.act_utils import build_policy_config, split_episode_indices
-from scripts.eval_lerobot import evaluate_checkpoint
+from scripts.eval_lerobot import apply_gps_dropout, evaluate_checkpoint
 from sim.policy_observation import validate_features
 from sim.stages import get_stage_config
 
@@ -25,6 +29,37 @@ def find_latest_checkpoint_under(output_dir: Path) -> Path:
     return max(checkpoints, key=lambda path: path.stat().st_mtime)
 
 
+@contextmanager
+def training_gps_dropout(dropout_prob: float, seed: int) -> Iterator[None]:
+    if dropout_prob <= 0.0:
+        yield
+        return
+
+    original_make_pre_post_processors = lerobot_train.make_pre_post_processors
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    @wraps(original_make_pre_post_processors)
+    def make_pre_post_processors_with_gps_dropout(*args, **kwargs):
+        preprocessor, postprocessor = original_make_pre_post_processors(*args, **kwargs)
+
+        def preprocessor_with_gps_dropout(batch):
+            batch = apply_gps_dropout(
+                batch=batch,
+                dropout_prob=dropout_prob,
+                generator=generator,
+            )
+            return preprocessor(batch)
+
+        return preprocessor_with_gps_dropout, postprocessor
+
+    lerobot_train.make_pre_post_processors = make_pre_post_processors_with_gps_dropout
+    try:
+        yield
+    finally:
+        lerobot_train.make_pre_post_processors = original_make_pre_post_processors
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=100_000)
@@ -34,6 +69,7 @@ def main() -> None:
     parser.add_argument("--train_fraction", type=float, default=0.9)
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--temporal_ensemble_coeff", type=float, default=0.01)
+    parser.add_argument("--gps_dropout_prob", type=float, default=0.0)
     parser.add_argument("--disable_image_transforms", action="store_true")
     parser.add_argument("--stage", type=int, default=1)
     parser.add_argument("--output_dir", type=Path, default=None)
@@ -49,6 +85,8 @@ def main() -> None:
         raise FileNotFoundError(f"LeRobot dataset not found at {stage_config.dataset_root}")
     if not 0.0 < args.train_fraction <= 1.0:
         raise ValueError("--train_fraction must be in (0, 1]")
+    if not 0.0 <= args.gps_dropout_prob <= 1.0:
+        raise ValueError("--gps_dropout_prob must be in [0, 1]")
 
     metadata = LeRobotDatasetMetadata(
         repo_id=stage_config.repo_id,
@@ -79,6 +117,7 @@ def main() -> None:
     print(f"training outputs: {output_dir}")
     print(f"split seed: {args.split_seed}")
     print(f"temporal ensemble coeff: {args.temporal_ensemble_coeff}")
+    print(f"gps dropout probability: {args.gps_dropout_prob:.3f}")
     print(f"image transforms enabled: {not args.disable_image_transforms}")
     if args.checkpoint is not None:
         print(f"warm-start checkpoint: {args.checkpoint}")
@@ -108,7 +147,11 @@ def main() -> None:
         save_checkpoint=True,
         wandb=WandBConfig(enable=False),
     )
-    train(cfg)
+    with training_gps_dropout(
+        dropout_prob=args.gps_dropout_prob,
+        seed=args.split_seed,
+    ):
+        lerobot_train.train(cfg)
 
     trained_checkpoint = find_latest_checkpoint_under(output_dir)
     print(f"trained checkpoint: {trained_checkpoint}")
@@ -123,6 +166,7 @@ def main() -> None:
         batch_size=args.eval_batch_size,
         num_workers=args.eval_num_workers,
         max_batches=args.eval_max_batches,
+        gps_dropout_prob=args.gps_dropout_prob,
     )
     print(f"validation batches: {results['validation_batches']}")
     print(f"mean validation loss: {results['mean_validation_loss']:.6f}")

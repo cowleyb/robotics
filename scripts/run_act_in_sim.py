@@ -8,7 +8,11 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.control_utils import predict_action
 
-from sim.policy_observation import build_lerobot_observation, validate_features
+from sim.policy_observation import (
+    build_lerobot_observation,
+    mask_gps_state,
+    validate_features,
+)
 from sim.stages import find_latest_checkpoint, get_stage_config
 from sim.world import DRIVE_LIMITS, MAX_STEERING_ANGLE, World
 
@@ -35,10 +39,13 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--gps_dropout_prob", type=float, default=None)
     args = parser.parse_args()
 
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
+    if args.gps_dropout_prob is not None and not 0.0 <= args.gps_dropout_prob <= 1.0:
+        raise ValueError("--gps_dropout_prob must be in [0, 1]")
 
     stage_config = get_stage_config(args.stage)
     checkpoint = args.checkpoint or find_latest_checkpoint(stage_config)
@@ -84,6 +91,10 @@ def main() -> None:
 
     print(f"{stage_config.label}")
     print(f"checkpoint: {checkpoint}")
+    print(
+        "policy gps dropout probability: "
+        f"{0.0 if args.gps_dropout_prob is None else args.gps_dropout_prob:.3f}"
+    )
     print(f"temporal ensemble coeff: {policy.config.temporal_ensemble_coeff}")
     try:
         for episode_idx in range(args.episodes):
@@ -95,6 +106,7 @@ def main() -> None:
                 seed = int(secrets.randbelow(2**31 - 1))
 
             policy.reset()
+            gps_dropout_rng = np.random.default_rng(seed)
             if episode_idx == 0:
                 observation = world.get_observation()
             else:
@@ -105,6 +117,13 @@ def main() -> None:
                 model_observation = build_lerobot_observation(
                     observation=observation,
                 )
+                if (
+                    args.gps_dropout_prob is not None
+                    and gps_dropout_rng.random() < args.gps_dropout_prob
+                ):
+                    model_observation["observation.state"] = mask_gps_state(
+                        model_observation["observation.state"]
+                    )
                 action = predict_action(
                     observation=model_observation,
                     policy=policy,

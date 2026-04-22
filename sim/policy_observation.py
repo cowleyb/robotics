@@ -19,6 +19,15 @@ GPS_STATE_FEATURE_NAMES = (
 GPS_STATE_SHAPE = (len(GPS_STATE_FEATURE_NAMES),)
 
 
+def mask_gps_state(state: np.ndarray) -> np.ndarray:
+    masked_state = np.asarray(state, dtype=np.float32).copy()
+    masked_state[0:2] = 0.0
+    masked_state[2] = 0.0
+    masked_state[3] = GPS_STALE_AGE_CLIP_S
+    masked_state[4] = GPS_HORIZONTAL_ACCURACY_CLIP_M
+    return np.ascontiguousarray(masked_state)
+
+
 def rotate_world_vector_to_car_frame(
     vector_xy: np.ndarray, car_quaternion: np.ndarray
 ) -> np.ndarray:
@@ -37,11 +46,14 @@ def rotate_world_vector_to_car_frame(
 
 def build_gps_state(observation: dict[str, np.ndarray]) -> np.ndarray:
     gps_position = np.asarray(observation["gps_position"][:2], dtype=np.float32)
-    goal_delta_world = np.asarray(
-        observation["goal_position"][:2] - gps_position,
-        dtype=np.float32,
-    )
     gps_valid = float(np.asarray(observation["gps_valid"], dtype=np.float32).reshape(-1)[0])
+    if gps_valid > 0.0:
+        goal_delta_world = np.asarray(
+            observation["goal_position"][:2] - gps_position,
+            dtype=np.float32,
+        )
+    else:
+        goal_delta_world = np.zeros(2, dtype=np.float32)
     gps_age_s = float(np.asarray(observation["gps_age_s"], dtype=np.float32).reshape(-1)[0])
     gps_horizontal_accuracy = float(
         np.asarray(observation["gps_horizontal_accuracy"], dtype=np.float32).reshape(-1)[0]

@@ -12,8 +12,39 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
 from scripts.act_utils import split_episode_indices
-from sim.policy_observation import validate_features
+from sim.policy_observation import (
+    GPS_HORIZONTAL_ACCURACY_CLIP_M,
+    GPS_STALE_AGE_CLIP_S,
+    validate_features,
+)
 from sim.stages import find_latest_checkpoint, get_stage_config
+
+
+def apply_gps_dropout(
+    batch: dict[str, torch.Tensor],
+    dropout_prob: float,
+    generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    if dropout_prob <= 0.0:
+        return batch
+
+    observation_state = batch["observation.state"]
+    dropout_mask = torch.rand(
+        observation_state.shape[0],
+        generator=generator,
+        device=observation_state.device,
+    ) < dropout_prob
+    if not torch.any(dropout_mask):
+        return batch
+
+    dropped_batch = dict(batch)
+    dropped_state = observation_state.clone()
+    dropped_state[dropout_mask, 0:2] = 0.0
+    dropped_state[dropout_mask, 2] = 0.0
+    dropped_state[dropout_mask, 3] = GPS_STALE_AGE_CLIP_S
+    dropped_state[dropout_mask, 4] = GPS_HORIZONTAL_ACCURACY_CLIP_M
+    dropped_batch["observation.state"] = dropped_state
+    return dropped_batch
 
 
 def evaluate_checkpoint(
@@ -24,6 +55,7 @@ def evaluate_checkpoint(
     batch_size: int = 16,
     num_workers: int = 4,
     max_batches: int | None = None,
+    gps_dropout_prob: float = 0.0,
 ) -> dict[str, int | float]:
     if not 0.0 < train_fraction <= 1.0:
         raise ValueError("--train_fraction must be in (0, 1]")
@@ -33,6 +65,8 @@ def evaluate_checkpoint(
         raise ValueError("num_workers must be non-negative")
     if max_batches is not None and max_batches < 1:
         raise ValueError("max_batches must be at least 1")
+    if not 0.0 <= gps_dropout_prob <= 1.0:
+        raise ValueError("--gps_dropout_prob must be in [0, 1]")
 
     stage_config = get_stage_config(stage)
     if not stage_config.dataset_root.exists():
@@ -114,10 +148,17 @@ def evaluate_checkpoint(
     total_items = 0
     batch_count = 0
     saw_kld_loss = False
+    gps_dropout_generator = torch.Generator()
+    gps_dropout_generator.manual_seed(split_seed)
 
     policy.train()
     with torch.no_grad():
         for batch in dataloader:
+            batch = apply_gps_dropout(
+                batch=batch,
+                dropout_prob=gps_dropout_prob,
+                generator=gps_dropout_generator,
+            )
             processed_batch = preprocessor(batch)
             loss, metrics = policy.forward(processed_batch)
 
@@ -156,6 +197,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_batches", type=int, default=None)
+    parser.add_argument("--gps_dropout_prob", type=float, default=0.0)
     args = parser.parse_args()
 
     stage_config = get_stage_config(args.stage)
@@ -168,10 +210,12 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_batches=args.max_batches,
+        gps_dropout_prob=args.gps_dropout_prob,
     )
 
     print(f"{stage_config.label}")
     print(f"checkpoint: {checkpoint}")
+    print(f"gps dropout probability: {args.gps_dropout_prob:.3f}")
     print(f"validation batches: {results['validation_batches']}")
     print(f"validation items: {results['validation_items']}")
     print(f"mean validation loss: {results['mean_validation_loss']:.6f}")
