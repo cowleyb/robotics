@@ -3,12 +3,13 @@ import math
 from pathlib import Path
 
 import genesis as gs
+import genesis.vis.keybindings as kb
 import torch
 from tensordict import TensorDict
 
 from genesis.utils.geom import pos_lookat_up_to_T, quat_to_xyz
 
-from sim2.car_geom import CarConfig, CarExtractor
+from sim_mentor_pi.car_config import CarConfig, CarExtractor
 from sim_mentor_pi.car_entity import CarEntity
 
 try:
@@ -42,13 +43,23 @@ class TestEnv:
     ):
         print(f"is gs_madrona available: {_ENABLE_MADRONA}")
         self.num_envs = num_envs
-        self.rendered_env_num = min(5, self.num_envs)
+        # TODO over here
+        self.rendered_env_num = min(1, self.num_envs)
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = target_cfg["num_commands"]
         self.cfg = env_cfg
         self.device = gs.device
         self.cam = None
         self.cams = []
+        self.manual = manual
+        self.manual_is_running = True
+        self.manual_action = torch.zeros(
+            (num_envs, 2), device=gs.device, dtype=gs.tc_float
+        )
+        self.manual_forward = False
+        self.manual_reverse = False
+        self.manual_left = False
+        self.manual_right = False
 
         self.dt = 0.01
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
@@ -141,7 +152,7 @@ class TestEnv:
                 file=str(CAR_PATH),
                 links_to_keep=(CAMERA_LINK_NAME,),
             ),
-            material=gs.materials.Rigid(friction=3.0),
+            material=gs.materials.Rigid(friction=5.0),
         )
         car_geom = CarExtractor(str(CAR_PATH)).get_geom()
         car_config = CarConfig(
@@ -149,9 +160,11 @@ class TestEnv:
             steering_joint_names=("base_to_left_hinge", "base_to_right_hinge"),
             driving_joint_names=("base_to_left_back_wheel", "base_to_right_back_wheel"),
         )
-        self.car = CarEntity(car_entity=raw_car, car_config=car_config)
+        self.car = CarEntity(car_entity=raw_car, car_config=car_config, dt=self.dt)
 
         self.scene.build(n_envs=num_envs)
+        if self.manual and show_viewer:
+            self.register_manual_keybinds()
 
         self.cam = self.cams[0] if self.cams else None
         camera_pose_in_camera_frame = pos_lookat_up_to_T(
@@ -220,6 +233,89 @@ class TestEnv:
         self.extras = {}
 
         self.reset()
+
+    def set_manual_forward(self, is_pressed: bool) -> None:
+        self.manual_forward = is_pressed
+        self.update_manual_action()
+
+    def set_manual_reverse(self, is_pressed: bool) -> None:
+        self.manual_reverse = is_pressed
+        self.update_manual_action()
+
+    def set_manual_left(self, is_pressed: bool) -> None:
+        self.manual_left = is_pressed
+        self.update_manual_action()
+
+    def set_manual_right(self, is_pressed: bool) -> None:
+        self.manual_right = is_pressed
+        self.update_manual_action()
+
+    def update_manual_action(self) -> None:
+        self.manual_action[:, 0] = float(self.manual_forward) - float(
+            self.manual_reverse
+        )
+        self.manual_action[:, 1] = float(self.manual_left) - float(self.manual_right)
+
+    def stop_manual(self) -> None:
+        self.manual_is_running = False
+
+    def register_manual_keybinds(self) -> None:
+        self.scene.viewer.register_keybinds(
+            kb.Keybind(
+                "forward",
+                kb.Key.UP,
+                kb.KeyAction.PRESS,
+                callback=lambda: self.set_manual_forward(True),
+            ),
+            kb.Keybind(
+                "stop forward",
+                kb.Key.UP,
+                kb.KeyAction.RELEASE,
+                callback=lambda: self.set_manual_forward(False),
+            ),
+            kb.Keybind(
+                "reverse",
+                kb.Key.DOWN,
+                kb.KeyAction.PRESS,
+                callback=lambda: self.set_manual_reverse(True),
+            ),
+            kb.Keybind(
+                "stop reverse",
+                kb.Key.DOWN,
+                kb.KeyAction.RELEASE,
+                callback=lambda: self.set_manual_reverse(False),
+            ),
+            kb.Keybind(
+                "left",
+                kb.Key.LEFT,
+                kb.KeyAction.PRESS,
+                callback=lambda: self.set_manual_left(True),
+            ),
+            kb.Keybind(
+                "stop left",
+                kb.Key.LEFT,
+                kb.KeyAction.RELEASE,
+                callback=lambda: self.set_manual_left(False),
+            ),
+            kb.Keybind(
+                "right",
+                kb.Key.RIGHT,
+                kb.KeyAction.PRESS,
+                callback=lambda: self.set_manual_right(True),
+            ),
+            kb.Keybind(
+                "stop right",
+                kb.Key.RIGHT,
+                kb.KeyAction.RELEASE,
+                callback=lambda: self.set_manual_right(False),
+            ),
+            kb.Keybind(
+                "quit",
+                kb.Key.ESCAPE,
+                kb.KeyAction.PRESS,
+                callback=self.stop_manual,
+            ),
+        )
 
     def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(
@@ -454,6 +550,9 @@ class TestEnv:
 
     def _reward_smooth(self):
         return torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+
+    def _reward_reverse(self):
+        return torch.clamp(-self.actions[:, 0], min=0.0)
 
     def _reward_success(self):
         return self.success_condition.to(gs.tc_float)
