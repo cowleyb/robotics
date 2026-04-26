@@ -1,10 +1,11 @@
 import argparse
 import os
-import genesis as gs
-from huggingface_hub import snapshot_download
-import numpy as np
-
+import pickle
+import shutil
 from importlib import metadata
+
+import genesis as gs
+
 from sim2.car_env import RoomEnv
 
 try:
@@ -16,7 +17,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 
 def get_train_cfg(exp_name):
-    train_cfg_dict = {
+    return {
         "algorithm": {
             "class_name": "PPO",
             "clip_param": 0.2,
@@ -57,141 +58,99 @@ def get_train_cfg(exp_name):
         "logger": "tensorboard",
     }
 
-    return train_cfg_dict
-
 
 def get_cfgs():
     env_cfg = {
-        # --- CONTROLS ---
-        "num_actions": 2,  # RC cars only need [Throttle, Steering]
-        # --- TERMINATION (When to auto-reset the sim) ---
-        "termination_if_x_greater_than": 5.0,  # Don't let it drive too far away
+        "num_actions": 2,
+        "termination_if_x_greater_than": 5.0,
         "termination_if_y_greater_than": 5.0,
-        "termination_if_roll_greater_than": 90,  # If the car flips over (90 deg), end episode
-        "termination_if_pitch_greater_than": 45,  # If it goes up a crazy ramp, end episode
-        # --- INITIAL POSE ---
-        "base_init_pos": [
-            0.0,
-            0.0,
-            0.1,
-        ],  # Start slightly above ground so it drops down
-        "base_init_quat": [1.0, 0.0, 0.0, 0.0],  # Flat on the ground
-        "at_target_threshold": 0.1,
-        # --- TIMING ---
-        "episode_length_s": 30.0,  # Give yourself 30 seconds to teleop to the box
-        "ctrl_dt": 0.02,  # 50 Hz control loop (standard for RC)
-        # --- CAMERA (CRITICAL FOR LEROBOT) ---
-        "cam_resolution": (160, 120),  # Keep it small! Pi needs this to run fast later
-        "cam_fov": 90,  # Wide angle lens
-        "cam_pos": [
-            0.2,
-            0.0,
-            0.15,
-        ],  # Position relative to car center (front, center, height)
-        "cam_lookat": [1.0, 0.0, 0.0],  # Look straight forward along the X axis
-        # --- VISUALIZATION ---
-        "visualize_target": True,  # Turn this ON so you can see the yellow box in Genesis
+        "termination_if_roll_greater_than": 90.0,
+        "termination_if_pitch_greater_than": 45.0,
+        "base_init_pos": [0.0, 0.0, 0.1],
+        "base_init_quat": [1.0, 0.0, 0.0, 0.0],
+        "at_target_threshold": 0.25,
+        "episode_length_s": 20.0,
+        "clip_actions": 1.0,
+        "cam_resolution": (160, 120),
+        "cam_fov": 90,
+        "cam_pos": [0.2, 0.0, 0.15],
+        "cam_lookat": [1.0, 0.0, 0.0],
+        "visualize_target": False,
         "visualize_camera": False,
         "max_visualize_FPS": 60,
     }
-
-    # --- OBSERVATION (For LeRobot State Vector) ---
-    # We define the dimension of the state vector LeRobot will receive.
-    # [error_x, error_y, box_size, is_visible]
     obs_cfg = {
         "state_dim": 4,
-        "image_shape": (
-            3,
-            120,
-            160,
-        ),  # (Channels, Height, Width) - standard PyTorch format
+        "image_shape": (3, 120, 160),
     }
-
-    # --- REWARD CONFIG ---
-    # DELETE THIS ENTIRELY. You are not doing RL. You do not need rewards.
-
-    # --- TARGET/YELLOW BOX CONFIG ---
-    # Instead of "commands", we just define where the yellow box spawns
+    reward_cfg = {
+        "reward_scales": {
+            "progress": 10.0,
+            "smooth": -0.1,
+            "success": 150.0,
+            "crash": -100.0,
+        }
+    }
     target_cfg = {
         "num_commands": 3,
-        "box_size": [0.3, 0.3, 0.3],  # 30cm yellow box
-        # Randomly spawn the box in a 4x4 meter area around the car
-        "pos_x_range": [-5.0, 5.0],
-        "pos_y_range": [-5.0, 5.0],
-        "pos_z_range": [0.1, 0.1],  # Always on the ground (half the box size)
+        "box_size": [0.3, 0.3, 0.3],
+        "pos_x_range": [-4.0, 4.0],
+        "pos_y_range": [-4.0, 4.0],
+        "pos_z_range": [0.1, 0.1],
     }
-
-    # Note: We return None for reward_cfg
-    return env_cfg, obs_cfg, None, target_cfg
+    return env_cfg, obs_cfg, reward_cfg, target_cfg
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--manual",
-        action="store_true",
-        help="Drive car manually with arrow keys",
-    )
-    parser.add_argument("--headless", action="store_true", help="Run without rendering")
-    parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument(
-        "--vis", action="store_true", default=False, help="Visualize the environment"
-    )
-    parser.add_argument(
-        "--cam", action="store_true", default=False, help="Visualize the camera view"
-    )
-
+    parser.add_argument("--exp_name", type=str, default="rc-car-yolo-rl")
+    parser.add_argument("--vis", action="store_true", default=False)
+    parser.add_argument("--cam", action="store_true", default=False)
+    parser.add_argument("--num_envs", type=int, default=1024)
+    parser.add_argument("--max_iterations", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
 
-    instruction = "Drive to A."
-
-    # How much we mess with the car in the simulation
-    recovery_data = {
-        "perturb_probability": 0,
-        "throttle_std": 0.08,
-        "steering_std": 0.25,
-        "burst_length_range_steps": (2, 5),
-        "recovery_length_range_steps": (20, 45),
-    }
-
-    seed = int(args.seed) if args.seed is not None else None
-    rng = np.random.default_rng(seed)
-    world_seed = rng.integers(0, 2**32 - 1)
-
-    # Download InteriorAgent scene
-    # asset_path = snapshot_download(
-    #     repo_id="spatialverse/InteriorAgent",
-    #     repo_type="dataset",
-    #     allow_patterns="kujiale_0003/*",
-    #     max_workers=4,
-    # )
-
-    env_cfg, obs_cfg, reward_cfg, target_cfg = get_cfgs()
-    if args.cam:
-        env_cfg["visualize_camera"] = True
-
+    backend = gs.cpu
     gs.init(
-        backend=gs.cpu,
+        backend=backend,
         precision="32",
         logging_level="warning",
         seed=args.seed,
-        # performance_mode=True,
+        performance_mode=not args.vis,
     )
 
+    log_dir = f"logs/{args.exp_name}"
+    env_cfg, obs_cfg, reward_cfg, target_cfg = get_cfgs()
+    train_cfg = get_train_cfg(args.exp_name)
+
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+
+    if args.vis:
+        env_cfg["visualize_target"] = True
+    if args.cam:
+        env_cfg["visualize_camera"] = True
+
+    with open(f"{log_dir}/cfgs.pkl", "wb") as f:
+        pickle.dump([env_cfg, obs_cfg, reward_cfg, target_cfg, train_cfg], f)
+
     env = RoomEnv(
-        base_seed=seed,
-        num_envs=1 if args.manual else 4,
-        show_viewer=args.vis,
+        base_seed=args.seed,
+        num_envs=args.num_envs,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         target_cfg=target_cfg,
-        manual=args.manual,
+        show_viewer=args.vis,
     )
 
-    while True:
-        env.step()
+    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner.learn(
+        num_learning_iterations=args.max_iterations,
+        init_at_random_ep_len=True,
+    )
 
 
 if __name__ == "__main__":

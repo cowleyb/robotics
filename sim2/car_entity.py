@@ -13,13 +13,11 @@ class CarEntity:
 
         self.car_config = car_config
         steer_dofs = [
-            self._entity.get_joint(name).dofs_idx_local
+            int(self._entity.get_joint(name).dofs_idx_local[0])
             for name in car_config.steering_joint_names
         ]
-        print(car_config.steering_joint_names)
-        print(steer_dofs)
         drive_dofs = [
-            self._entity.get_joint(name).dofs_idx_local
+            int(self._entity.get_joint(name).dofs_idx_local[0])
             for name in car_config.driving_joint_names
         ]
 
