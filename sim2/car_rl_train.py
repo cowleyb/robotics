@@ -97,9 +97,9 @@ def get_cfgs():
 
     # --- OBSERVATION (For LeRobot State Vector) ---
     # We define the dimension of the state vector LeRobot will receive.
-    # [error_x, error_y, box_size, is_visible, last_error_x, last_box_size]
+    # [error_x, error_y, box_size, is_visible]
     obs_cfg = {
-        "state_dim": 6,
+        "state_dim": 4,
         "image_shape": (
             3,
             120,
@@ -127,7 +127,11 @@ def get_cfgs():
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manual", action="store_true", help="Drive car with wasd")
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Drive car manually with arrow keys",
+    )
     parser.add_argument("--headless", action="store_true", help="Run without rendering")
     parser.add_argument("--stage", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
@@ -177,12 +181,13 @@ def main() -> None:
 
     env = RoomEnv(
         base_seed=seed,
-        num_envs=4,
+        num_envs=1 if args.manual else 4,
         show_viewer=args.vis,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         target_cfg=target_cfg,
+        manual=args.manual,
     )
 
     while True:

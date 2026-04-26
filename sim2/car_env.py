@@ -13,6 +13,9 @@ from genesis.utils.geom import (
     transform_quat_by_quat,
 )
 
+from sim2.car_entity import CarEntity
+from sim2.car_geom import CarConfig, CarExtractor
+
 try:
     import gs_madrona
 
@@ -43,6 +46,7 @@ class RoomEnv:
         reward_cfg,
         target_cfg,
         show_viewer=False,
+        manual=False,
     ):
         print(f"is gs_madrona available: {_ENABLE_MADRONA}")
         self.num_envs = num_envs
@@ -114,14 +118,17 @@ class RoomEnv:
                 GUI=True,
             )
 
-        # add drone
+        # add car
         self.base_init_pos = torch.tensor(
             self.env_cfg["base_init_pos"], device=gs.device
         )
         self.base_init_quat = torch.tensor(
             self.env_cfg["base_init_quat"], device=gs.device
         )
-        self.car = self.scene.add_entity(gs.morphs.URDF(file=str(CAR_PATH)))
+        raw_car = self.scene.add_entity(gs.morphs.URDF(file=str(CAR_PATH)))
+        car_geom = CarExtractor(str(CAR_PATH)).get_geom()
+        car_config = CarConfig(geom=car_geom)
+        self.car = CarEntity(car_entity=raw_car, car_config=car_config)
 
         # build scene
         self.scene.build(n_envs=num_envs)
@@ -135,6 +142,9 @@ class RoomEnv:
         )
         self.base_pos = torch.zeros(
             (self.num_envs, 3), device=gs.device, dtype=gs.tc_float
+        )
+        self.actions = torch.zeros(
+            (self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float
         )
 
     def _resample_commands(self, envs_idx):
@@ -156,6 +166,11 @@ class RoomEnv:
         )
 
     def step(self) -> int:
+        self.actions[0] = torch.tensor(
+            [6, 7.0], device=gs.device
+        )  # throttle, steering_input
+        self.car.move_car(self.actions)
+
         # update target position
         if self.target is not None:
             self.target.set_pos(self.commands, zero_velocity=True)
