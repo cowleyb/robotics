@@ -113,3 +113,7 @@ class CarEntity:
         )
         self._drive_velocity = self._drive_velocity + delta
         return self._drive_velocity
+
+    def reset_drive_velocity(self, envs_idx) -> None:
+        if self._drive_velocity is not None:
+            self._drive_velocity[envs_idx] = 0.0

@@ -42,12 +42,13 @@ def main():
 
     env = TestEnv(
         base_seed=1,
-        num_envs=1,
+        num_envs=5,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         target_cfg=target_cfg,
         show_viewer=True,
+        manual=True,
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
@@ -68,9 +69,12 @@ def main():
                 fps=env_cfg["max_visualize_FPS"],
             )
         else:
-            for _ in range(max_sim_step):
-                actions = policy(obs_dict)
-                obs_dict, _, _, _ = env.step(actions)
+            try:
+                while env.manual_is_running:
+                    actions = policy(obs_dict)
+                    obs_dict, _, _, _ = env.step(actions)
+            except KeyboardInterrupt:
+                print("stopped")
 
 
 if __name__ == "__main__":

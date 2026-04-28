@@ -2,7 +2,7 @@ import argparse
 
 import genesis as gs
 
-from sim_mentor_pi.start import get_cfgs
+from sim_mentor_pi.car_train import get_cfgs
 from sim_mentor_pi.car_env import TestEnv
 
 
@@ -16,7 +16,7 @@ def main() -> None:
     gs.init(
         backend=gs.cpu,
         precision="32",
-        logging_level="warning",
+        # logging_level="warning",
         seed=args.seed,
         performance_mode=False,
     )

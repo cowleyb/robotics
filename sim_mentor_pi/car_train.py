@@ -68,7 +68,7 @@ def get_cfgs():
         "termination_if_pitch_greater_than": 45.0,
         "base_init_pos": [0.0, 0.0, 0.0335],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
-        "at_target_threshold": 0.25,
+        "at_target_threshold": 0.15,
         "episode_length_s": 20.0,
         "clip_actions": 1.0,
         "cam_resolution": (160, 120),
@@ -91,6 +91,7 @@ def get_cfgs():
     reward_cfg = {
         "reward_scales": {
             "progress": 20.0,
+            "heading": 1.0,
             "reverse": -1.0,
             "smooth": -0.02,
             "success": 200.0,
@@ -101,8 +102,8 @@ def get_cfgs():
     target_cfg = {
         "num_commands": 3,
         "box_size": [0.3, 0.3, 0.3],
-        "pos_x_range": [-4.0, 4.0],
-        "pos_y_range": [-4.0, 4.0],
+        "pos_x_range": [-1.0, 1.0],
+        "pos_y_range": [-1.0, 1.0],
         "pos_z_range": [0.1, 0.1],
     }
     return env_cfg, obs_cfg, reward_cfg, target_cfg

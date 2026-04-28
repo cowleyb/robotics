@@ -44,6 +44,10 @@ class CarExtractor:
         return list(map(float, xyz))
 
     def _get_wheel_radius(self) -> float:
+        configured_radius = self.root.attrib.get("wheel_radius")
+        if configured_radius is not None:
+            return float(configured_radius)
+
         # assumes all wheels use same cylinder geometry
         wheel_link = self.root.find(".//link[@name='left_front_wheel']")
         if wheel_link is None:

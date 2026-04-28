@@ -21,7 +21,7 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-CAR_PATH = BASE_DIR / "assets" / "newcar.xacro"
+CAR_PATH = BASE_DIR / "assets" / "mentorpi_car.xacro"
 CAMERA_LINK_NAME = "depth_cam"
 
 
@@ -44,7 +44,7 @@ class TestEnv:
         print(f"is gs_madrona available: {_ENABLE_MADRONA}")
         self.num_envs = num_envs
         # TODO over here
-        self.rendered_env_num = min(1, self.num_envs)
+        self.rendered_env_num = min(5, self.num_envs)
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = target_cfg["num_commands"]
         self.cfg = env_cfg
@@ -87,13 +87,14 @@ class TestEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
+                noslip_iterations=4,
             ),
             show_viewer=show_viewer,
         )
 
         self.scene.add_entity(
             gs.morphs.Plane(),
-            material=gs.materials.Rigid(friction=3.0),
+            material=gs.materials.Rigid(friction=1.2),
         )
 
         if self.env_cfg["visualize_target"]:
@@ -151,8 +152,9 @@ class TestEnv:
             gs.morphs.URDF(
                 file=str(CAR_PATH),
                 links_to_keep=(CAMERA_LINK_NAME,),
+                default_armature=0.001,
             ),
-            material=gs.materials.Rigid(friction=5.0),
+            material=gs.materials.Rigid(friction=2.2),
         )
         car_geom = CarExtractor(str(CAR_PATH)).get_geom()
         car_config = CarConfig(
@@ -215,6 +217,7 @@ class TestEnv:
             (self.num_envs, 3), device=gs.device, dtype=gs.tc_float
         )
         self.last_rel_pos = torch.zeros_like(self.rel_pos)
+        self.base_rel_pos = torch.zeros_like(self.rel_pos)
         self.obs_buf = torch.zeros(
             (self.num_envs, self.obs_cfg["state_dim"]),
             device=gs.device,
@@ -328,8 +331,8 @@ class TestEnv:
             *self.target_cfg["pos_z_range"], (len(envs_idx),), gs.device
         )
 
-    def simulate_yolo_box(self) -> torch.Tensor:
-        yaw = torch.atan2(
+    def _yaw_from_base_quat(self) -> torch.Tensor:
+        return torch.atan2(
             2.0
             * (
                 self.base_quat[:, 0] * self.base_quat[:, 3]
@@ -342,27 +345,41 @@ class TestEnv:
                 + self.base_quat[:, 3] * self.base_quat[:, 3]
             ),
         )
+
+    def _target_pos_in_base_frame(self) -> torch.Tensor:
+        yaw = self._yaw_from_base_quat()
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
+
+        return torch.stack(
+            (
+                cos_yaw * self.rel_pos[:, 0] + sin_yaw * self.rel_pos[:, 1],
+                -sin_yaw * self.rel_pos[:, 0] + cos_yaw * self.rel_pos[:, 1],
+                self.rel_pos[:, 2],
+            ),
+            dim=1,
+        )
+
+    def simulate_yolo_box(self) -> torch.Tensor:
+        self.base_rel_pos[:] = self._target_pos_in_base_frame()
+        depth = torch.clamp(self.base_rel_pos[:, 0], min=1e-6)
+        lateral = self.base_rel_pos[:, 1]
         half_fov_x = math.radians(self.env_cfg["cam_fov"]) * 0.5
         half_fov_y = math.atan(
             math.tan(half_fov_x)
             * (self.obs_cfg["image_shape"][1] / self.obs_cfg["image_shape"][2])
         )
-        depth = torch.clamp(
-            cos_yaw * self.rel_pos[:, 0] + sin_yaw * self.rel_pos[:, 1], min=1e-6
-        )
 
         error_x = (
             torch.atan2(
-                -sin_yaw * self.rel_pos[:, 0] + cos_yaw * self.rel_pos[:, 1],
+                lateral,
                 depth,
             )
             / half_fov_x
         )
         error_y = (
             torch.atan2(
-                self.rel_pos[:, 2]
+                self.base_rel_pos[:, 2]
                 + float(self.target_cfg["box_size"][2]) * 0.5
                 - float(self.env_cfg["cam_pos"][2]),
                 depth,
@@ -375,7 +392,7 @@ class TestEnv:
             * math.tan(half_fov_x)
         )
         is_visible = (
-            (cos_yaw * self.rel_pos[:, 0] + sin_yaw * self.rel_pos[:, 1] > 0.0)
+            (self.base_rel_pos[:, 0] > 0.0)
             & (torch.abs(error_x) <= 1.0)
             & (torch.abs(error_y) <= 1.0)
         )
@@ -391,9 +408,10 @@ class TestEnv:
         )
 
     def _update_observation(self):
+        self.base_rel_pos[:] = self._target_pos_in_base_frame()
         self.obs_buf = torch.cat(
             [
-                torch.clip(self.rel_pos * self.obs_scales["rel_pos"], -1.0, 1.0),
+                torch.clip(self.base_rel_pos * self.obs_scales["rel_pos"], -1.0, 1.0),
                 self.base_quat,
                 torch.clip(self.base_lin_vel * self.obs_scales["lin_vel"], -1.0, 1.0),
                 torch.clip(self.base_ang_vel * self.obs_scales["ang_vel"], -1.0, 1.0),
@@ -502,6 +520,7 @@ class TestEnv:
             zero_velocity=True,
         )
         self.car.zero_all_dofs_velocity(envs_idx=envs_idx)
+        self.car.reset_drive_velocity(envs_idx)
 
         # Reset buffers
         self.actions[envs_idx] = 0.0
@@ -534,6 +553,7 @@ class TestEnv:
         self.success_condition[envs_idx] = False
         self.crash_condition[envs_idx] = False
         self.timeout_condition[envs_idx] = False
+        self._update_observation()
 
     def reset(self):
         self.reset_buf[:] = 1
@@ -544,6 +564,12 @@ class TestEnv:
         return torch.norm(self.last_rel_pos[:, :2], dim=1) - torch.norm(
             self.rel_pos[:, :2], dim=1
         )
+
+    def _reward_heading(self):
+        target_distance = torch.norm(self.base_rel_pos[:, :2], dim=1).clamp_min(1e-6)
+        target_forward_alignment = self.base_rel_pos[:, 0] / target_distance
+        forward_throttle = torch.clamp(self.actions[:, 0], min=0.0)
+        return target_forward_alignment * forward_throttle
 
     def _reward_visible(self):
         return self.obs_buf[:, 3]
