@@ -87,6 +87,7 @@ class TestEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
+                enable_self_collision=False,
                 noslip_iterations=4,
             ),
             show_viewer=show_viewer,
@@ -568,8 +569,7 @@ class TestEnv:
     def _reward_heading(self):
         target_distance = torch.norm(self.base_rel_pos[:, :2], dim=1).clamp_min(1e-6)
         target_forward_alignment = self.base_rel_pos[:, 0] / target_distance
-        forward_throttle = torch.clamp(self.actions[:, 0], min=0.0)
-        return target_forward_alignment * forward_throttle
+        return target_forward_alignment * self.actions[:, 0]
 
     def _reward_visible(self):
         return self.obs_buf[:, 3]

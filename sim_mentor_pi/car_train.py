@@ -92,7 +92,6 @@ def get_cfgs():
         "reward_scales": {
             "progress": 20.0,
             "heading": 1.0,
-            "reverse": -1.0,
             "smooth": -0.02,
             "success": 200.0,
             "crash": -100.0,
@@ -117,6 +116,7 @@ def main():
     parser.add_argument("--num_envs", type=int, default=1024)
     parser.add_argument("--max_iterations", type=int, default=300)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--resume", action="store_true", default=False)
     args = parser.parse_args()
 
     backend = gs.cpu
@@ -132,7 +132,7 @@ def main():
     env_cfg, obs_cfg, reward_cfg, target_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name)
 
-    if os.path.exists(log_dir):
+    if os.path.exists(log_dir) and not args.resume:
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -155,6 +155,16 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    if args.resume:
+        checkpoints = [
+            int(path.removeprefix("model_").removesuffix(".pt"))
+            for path in os.listdir(log_dir)
+            if path.startswith("model_") and path.endswith(".pt")
+        ]
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoints found in {log_dir}")
+        ckpt = max(checkpoints)
+        runner.load(os.path.join(log_dir, f"model_{ckpt}.pt"))
     runner.learn(
         num_learning_iterations=args.max_iterations,
         init_at_random_ep_len=True,
