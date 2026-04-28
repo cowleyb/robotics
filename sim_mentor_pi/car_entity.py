@@ -50,24 +50,35 @@ class CarEntity:
         angular_speed = steering_input * MAX_ANGULAR_VELOCITY_RADPS
         linear_speed = throttle_input * MAX_DRIVE_VELOCITY_MPS
 
-        # Ackermann steering only has a meaningful angle when the car is moving.
-        # Otherwise command zero so released keys return the front wheels to center.
-        steering_angle = torch.zeros_like(steering_input)
+        # The real car receives one servo command, then the mechanical linkage
+        # gives each front wheel its own Ackermann angle. Genesis has separate
+        # left/right steering joints, so apply those two angles directly.
+        # Target steering angles for Genesis: [left_front_angle, right_front_angle].
+        steering_targets = torch.zeros(
+            (actions.shape[0], self.num_steer_dofs),
+            device=gs.device,
+            dtype=gs.tc_float,
+        )
         turning_envs = (torch.abs(linear_speed) > EPSILON) & (
             torch.abs(angular_speed) > EPSILON
         )
 
-        steering_angle[turning_envs] = torch.atan(
-            self.car_config.geom.wheelbase
-            * angular_speed[turning_envs]
-            / linear_speed[turning_envs]
+        turn_radius = linear_speed[turning_envs] / angular_speed[turning_envs]
+        half_track = self.car_config.geom.track_width / 2
+        left_steering = torch.atan(
+            self.car_config.geom.wheelbase / (turn_radius - half_track)
         )
-        steering_angle = torch.clamp(
-            steering_angle,
+        right_steering = torch.atan(
+            self.car_config.geom.wheelbase / (turn_radius + half_track)
+        )
+        steering_targets[turning_envs] = torch.column_stack(
+            (left_steering, right_steering)
+        )
+        steering_targets = torch.clamp(
+            steering_targets,
             self._steering_limit[0],
             self._steering_limit[1],
         )
-        steering_targets = torch.column_stack([steering_angle] * self.num_steer_dofs)
         self._entity.control_dofs_position(
             position=steering_targets,
             dofs_idx_local=self.steer_dofs_idx,
