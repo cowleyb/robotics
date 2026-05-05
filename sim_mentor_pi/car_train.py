@@ -68,7 +68,7 @@ def get_cfgs():
         "termination_if_pitch_greater_than": 45.0,
         "base_init_pos": [0.0, 0.0, 0.0335],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
-        "at_target_threshold": 0.15,
+        "at_target_threshold": 0.01,
         "episode_length_s": 20.0,
         "clip_actions": 1.0,
         "cam_resolution": (160, 120),
@@ -92,6 +92,8 @@ def get_cfgs():
         "reward_scales": {
             "progress": 20.0,
             "heading": 1.0,
+            "reverse": -0.2,
+            "steering": -0.1,
             "smooth": -0.02,
             "success": 200.0,
             "crash": -100.0,

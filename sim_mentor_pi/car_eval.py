@@ -39,6 +39,13 @@ def main():
     env_cfg["visualize_target"] = True
     env_cfg["visualize_camera"] = args.record
     env_cfg["max_visualize_FPS"] = 60
+    env_cfg["target_cfg"] = {
+        "num_commands": 3,
+        "box_size": [0.3, 0.3, 0.3],
+        "pos_x_range": [-4.0, 4.0],
+        "pos_y_range": [-4.0, 4.0],
+        "pos_z_range": [0.1, 0.1],
+    }
 
     env = TestEnv(
         base_seed=1,

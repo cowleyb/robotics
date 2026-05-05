@@ -577,6 +577,9 @@ class TestEnv:
     def _reward_smooth(self):
         return torch.sum(torch.square(self.actions - self.last_actions), dim=1)
 
+    def _reward_steering(self):
+        return torch.square(self.actions[:, 1])
+
     def _reward_reverse(self):
         return torch.clamp(-self.actions[:, 0], min=0.0)
 
