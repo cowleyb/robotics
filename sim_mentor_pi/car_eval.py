@@ -19,8 +19,8 @@ from sim_mentor_pi.car_env import TestEnv
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="rc-car-yolo-rl")
-    parser.add_argument("--ckpt", type=int, default=300)
+    parser.add_argument("-e", "--exp_name", type=str, default="room-goal-privileged-rl")
+    parser.add_argument("--ckpt", type=int, default=None)
     parser.add_argument("--record", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -39,14 +39,6 @@ def main():
     env_cfg["visualize_target"] = True
     env_cfg["visualize_camera"] = args.record
     env_cfg["max_visualize_FPS"] = 60
-    env_cfg["target_cfg"] = {
-        "num_commands": 3,
-        "box_size": [0.3, 0.3, 0.3],
-        "pos_x_range": [-4.0, 4.0],
-        "pos_y_range": [-4.0, 4.0],
-        "pos_z_range": [0.1, 0.1],
-    }
-
     env = TestEnv(
         base_seed=1,
         num_envs=5,
@@ -59,7 +51,20 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
-    runner.load(os.path.join(log_dir, f"model_{args.ckpt}.pt"))
+    ckpt = args.ckpt
+    if ckpt is None:
+        checkpoints = [
+            int(path.removeprefix("model_").removesuffix(".pt"))
+            for path in os.listdir(log_dir)
+            if path.startswith("model_") and path.endswith(".pt")
+        ]
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoints found in {log_dir}")
+        ckpt = max(checkpoints)
+    print(f"watching run: {args.exp_name}")
+    print(f"checkpoint: model_{ckpt}.pt")
+    print(f"goal walls enabled: {env_cfg['goal_walls']['enabled']}")
+    runner.load(os.path.join(log_dir, f"model_{ckpt}.pt"))
     policy = runner.get_inference_policy(device=gs.device)
 
     obs_dict = env.reset()
